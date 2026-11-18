@@ -1,0 +1,23 @@
+node_modules/
+dist/
+src-tauri/target/
+artifacts/
+.DS_Store
+
+src-tauri/gen/
+.worktrees/
+
+/AGENTS.md
+/.agents/
+/.scratch/
+/.github/
+
+# Local configuration and signing material
+/.env
+/.env.*
+!/.env.example
+/.npmrc
+/.codex/
+/.aws/
+*.p12
+*.pfx
