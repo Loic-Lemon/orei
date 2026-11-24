@@ -37,6 +37,7 @@ pub(crate) enum MenuAction {
     Edit(&'static str),
     Export,
     Quit,
+    Settings,
 }
 
 impl MenuAction {
@@ -47,6 +48,7 @@ impl MenuAction {
             Self::Edit(payload) => Some(("edit-request", Some(payload))),
             Self::Export => Some(("export-request", None)),
             Self::Quit => None,
+            Self::Settings => Some(("settings-request", None)),
         }
     }
 }
@@ -70,6 +72,7 @@ pub(crate) fn action(id: &str) -> Option<MenuAction> {
         "find" => Some(MenuAction::Edit("find")),
         "export" => Some(MenuAction::Export),
         "quit-orei" => Some(MenuAction::Quit),
+        "settings" => Some(MenuAction::Settings),
         _ => None,
     }
 }
@@ -146,6 +149,14 @@ pub(crate) const LAYOUT: &[SubmenuSpec] = &[
         entries: &[
             Entry::About,
             Entry::Separator,
+            // Apple's menu-bar guidance puts Settings directly below About; Services and the
+            // window/application commands follow in the usual order. Document save variants
+            // sit with Settings in the app menu on macOS.
+            command("settings", "Settings…", Some("CmdOrCtrl+,"), true),
+            Entry::Separator,
+            command("save-as", "Save As…", Some("CmdOrCtrl+Shift+S"), true),
+            command("save-copy", "Save Copy…", None, true),
+            Entry::Separator,
             Entry::Services,
             Entry::Separator,
             Entry::Hide,
@@ -162,8 +173,6 @@ pub(crate) const LAYOUT: &[SubmenuSpec] = &[
             command("new-document", "New", Some("CmdOrCtrl+N"), true),
             command("open-document", "Open…", Some("CmdOrCtrl+O"), true),
             command("save", "Save", Some("CmdOrCtrl+S"), true),
-            command("save-as", "Save As…", Some("CmdOrCtrl+Shift+S"), true),
-            command("save-copy", "Save Copy…", None, true),
             Entry::Separator,
             command("close-document", "Close Document", Some("CmdOrCtrl+W"), true),
             Entry::Separator,
@@ -305,6 +314,9 @@ mod tests {
                 .position(|entry| *entry == wanted)
                 .unwrap_or_else(|| panic!("{wanted:?} missing from the application menu"))
         };
+        assert_eq!(entries.first(), Some(&Entry::About));
+        assert_eq!(command_id(&entries[1]), None, "About must be followed by its separator");
+        assert_eq!(command_id(&entries[2]), Some("settings"));
         assert!(position(Entry::About) < position(Entry::Services));
         assert!(position(Entry::Services) < position(Entry::Hide));
         assert!(position(Entry::Hide) < position(Entry::HideOthers));
@@ -314,6 +326,43 @@ mod tests {
         // would bypass the close guard's save/recovery step.
         assert_eq!(action("quit-orei"), Some(MenuAction::Quit));
         assert_eq!(accelerator("quit-orei"), Some("CmdOrCtrl+Q"));
+        assert_eq!(action("settings"), Some(MenuAction::Settings));
+        assert_eq!(accelerator("settings"), Some("CmdOrCtrl+,"));
+        assert_eq!(action("settings").and_then(MenuAction::webview_event), Some(("settings-request", None)));
+    }
+
+    #[test]
+    fn save_variants_are_unique_commands_near_settings_in_the_application_menu() {
+        let app = submenu("orei").entries;
+        let file = submenu("File").entries;
+        let ids = |entries: &[Entry]| {
+            entries
+                .iter()
+                .filter_map(command_id)
+                .collect::<Vec<_>>()
+        };
+
+        assert!(ids(app).contains(&"save-as"));
+        assert!(ids(app).contains(&"save-copy"));
+        assert!(!ids(file).contains(&"save-as"));
+        assert!(!ids(file).contains(&"save-copy"));
+        assert!(ids(file).contains(&"save"), "ordinary Save must remain in File");
+
+        let settings = app
+            .iter()
+            .position(|entry| command_id(entry) == Some("settings"))
+            .expect("Settings missing from the application menu");
+        assert_eq!(app[settings + 1], Entry::Separator);
+        assert_eq!(command_id(&app[settings + 2]), Some("save-as"));
+        assert_eq!(command_id(&app[settings + 3]), Some("save-copy"));
+        assert_eq!(app[settings + 4], Entry::Separator);
+
+        assert_eq!(action("save-as"), Some(MenuAction::Document("save-as")));
+        assert_eq!(action("save-copy"), Some(MenuAction::Document("save-copy")));
+        assert_eq!(accelerator("save-as"), Some("CmdOrCtrl+Shift+S"));
+        assert_eq!(accelerator("save-copy"), None);
+        assert!(enabled("save-as"));
+        assert!(enabled("save-copy"));
     }
 
     #[test]

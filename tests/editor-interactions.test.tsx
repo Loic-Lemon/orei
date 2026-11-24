@@ -116,7 +116,7 @@ test('selecting a template creates a new draft and preserves the current diagram
   expect(screen.getByRole('tab',{name:'Untitled 1'})).toHaveAttribute('aria-selected','true');
   expect(source.value).toMatch(/^sequenceDiagram\n/);
   await user.click(screen.getByRole('radio',{name:'Styling'}));
-  expect(screen.getByRole('combobox',{name:'Color scheme'})).toHaveTextContent('Graphite');
+  expect(screen.getByRole('combobox',{name:'Color scheme'})).toHaveTextContent('Paper');
   await user.click(screen.getByRole('radio',{name:'Diagram'}));
   await user.click(screen.getByRole('tab',{name:'small'}));
   expect(source.value).toBe(original);
@@ -347,15 +347,58 @@ test('palette remains usable when a variable is missing and its value is cleared
 test('preview drag pans both axes and stops after release', () => {
   render(<App/>);
   const canvas=screen.getByLabelText('Preview canvas');
-  Object.defineProperty(canvas,'setPointerCapture',{value:vi.fn()});
+  const capture=vi.fn();
+  Object.defineProperty(canvas,'setPointerCapture',{value:capture});
   Object.defineProperty(canvas,'releasePointerCapture',{value:vi.fn()});
   canvas.scrollLeft=100;canvas.scrollTop=80;
   fireEvent.pointerDown(canvas,{pointerId:1,button:0,clientX:100,clientY:100});
+  expect(capture).not.toHaveBeenCalled();
   fireEvent.pointerMove(canvas,{pointerId:1,clientX:70,clientY:60});
+  expect(capture).toHaveBeenCalledWith(1);
   expect(canvas.scrollLeft).toBe(130);expect(canvas.scrollTop).toBe(120);
   fireEvent.pointerUp(canvas,{pointerId:1});
   fireEvent.pointerMove(canvas,{pointerId:1,clientX:0,clientY:0});
   expect(canvas.scrollLeft).toBe(130);expect(canvas.scrollTop).toBe(120);
+});
+
+test('double-clicking a preview image opens Diagram and selects its source line', async () => {
+  render(<App/>);
+  await screen.findByText('Current preview');
+  const svg=screen.getByTestId('preview').shadowRoot!.querySelector('svg')!;
+  const source=screen.getByLabelText('Diagram source') as HTMLTextAreaElement;
+  source.style.lineHeight='20px';
+  Object.defineProperty(source,'clientHeight',{value:40});
+  const original=source.value;
+  const styling=screen.getByRole('radio',{name:'Styling'});
+  fireEvent.click(styling);
+
+  fireEvent.doubleClick(svg,{composed:true});
+  expect(styling).toBeChecked();
+  fireEvent.doubleClick(svg.querySelector('image')!,{composed:true});
+
+  expect(screen.getByRole('radio',{name:'Diagram'})).toBeChecked();
+  expect(source).toHaveFocus();
+  expect(source).toHaveValue(original);
+  expect(source.scrollTop).toBeGreaterThan(0);
+  expect(source.value.slice(source.selectionStart,source.selectionEnd))
+    .toBe(' E --> F@{ img: "assets/local.png", label: "Local image", w: 64, h: 48 }');
+});
+
+test('a retained preview cannot navigate an edited source', async () => {
+  render(<App/>);
+  await screen.findByText('Current preview');
+  const node=screen.getByTestId('preview').shadowRoot!.querySelector('[data-id="A"] text')!;
+  const source=screen.getByLabelText('Diagram source') as HTMLTextAreaElement;
+  fireEvent.change(source,{target:{value:`\n\n${source.value}\n F -->`}});
+  const styling=screen.getByRole('radio',{name:'Styling'});
+  fireEvent.click(styling);
+
+  fireEvent.doubleClick(node,{composed:true});
+  expect(styling).toBeChecked();
+
+  await screen.findByText('Preview out of date');
+  fireEvent.doubleClick(node,{composed:true});
+  expect(styling).toBeChecked();
 });
 
 test('duplicate palette declarations pause controls without showing misleading values', async () => {
@@ -397,4 +440,87 @@ test.each(['pointerUp','pointerCancel','lostPointerCapture','blur'] as const)('p
   expect(css.value).toBe(first);
   fireEvent.keyDown(swatch,{key:'z',metaKey:true});
   expect(css.value).toBe(original);
+});
+
+test.each([
+  ['(', ')', 'Diagram source', 'Diagram'],
+  ['[', ']', 'Diagram source', 'Diagram'],
+  ['{', '}', 'Diagram stylesheet', 'Styling'],
+  ['"', '"', 'Diagram stylesheet', 'Styling'],
+  ["'", "'", 'Diagram source', 'Diagram'],
+])('typing %s inserts its closer %s in %s', async (open,close,label,view) => {
+  const user=userEvent.setup();
+  render(<App/>);
+  if(view==='Styling')await user.click(screen.getByRole('radio',{name:view}));
+  const editor=screen.getByLabelText(label) as HTMLTextAreaElement;
+  fireEvent.change(editor,{target:{value:''}});
+  editor.focus();
+  await user.keyboard(open==='[' || open==='{' ? open.repeat(2) : open);
+
+  expect(editor.value).toBe(open+close);
+  expect(editor.selectionStart).toBe(1);
+  expect(editor.selectionEnd).toBe(1);
+  await user.keyboard('text'+close);
+  expect(editor.value).toBe(open+'text'+close);
+  expect(editor.selectionStart).toBe(6);
+  await user.keyboard('{Backspace}');
+  expect(editor.value).toBe(open+'text');
+});
+
+test.each([['Backspace',1],['Delete',0]] as const)('paired delimiter deletion with %s keeps the contents and an authored closer',async(key,caret)=>{
+  const user=userEvent.setup();
+  render(<App/>);
+  const editor=screen.getByLabelText('Diagram source') as HTMLTextAreaElement;
+  fireEvent.change(editor,{target:{value:')'}});
+  editor.focus();
+  editor.setSelectionRange(0,0);
+  await user.keyboard('(text');
+  expect(editor.value).toBe('(text))');
+  editor.setSelectionRange(caret,caret);
+  await user.keyboard(`{${key}}`);
+  expect(editor.value).toBe('text)');
+  expect(editor.selectionStart).toBe(0);
+
+  fireEvent.keyDown(editor,{key:'z',metaKey:true});
+  expect(editor.value).toBe('(text))');
+  expect(editor.selectionStart).toBe(caret);
+  await user.keyboard(`{${key}}`);
+  expect(editor.value).toBe('text)');
+});
+
+test('paired delimiter deletion is directional even when the pair is empty',async()=>{
+  const user=userEvent.setup();
+  render(<App/>);
+  const editor=screen.getByLabelText('Diagram source') as HTMLTextAreaElement;
+  fireEvent.change(editor,{target:{value:''}});
+  editor.focus();
+  await user.keyboard('({Delete}');
+  expect(editor.value).toBe('(');
+  await user.keyboard('({Backspace}');
+  expect(editor.value).toBe('(');
+});
+
+test('paired delimiters keep authored punctuation, apostrophes and escaped quotes literal',async()=>{
+  const user=userEvent.setup();
+  render(<App/>);
+  const editor=screen.getByLabelText('Diagram source') as HTMLTextAreaElement;
+  fireEvent.change(editor,{target:{value:'()'}});
+  editor.focus();
+  editor.setSelectionRange(1,1);
+  await user.keyboard('{Backspace}');
+  expect(editor.value).toBe(')');
+  editor.setSelectionRange(0,0);
+  await user.keyboard('It\'s \\"');
+  expect(editor.value).toBe('It\'s \\"' + ')');
+});
+
+test('paired delimiters let a literal quote finish an existing string',async()=>{
+  const user=userEvent.setup();
+  render(<App/>);
+  const editor=screen.getByLabelText('Diagram source') as HTMLTextAreaElement;
+  fireEvent.change(editor,{target:{value:'A["label]'}});
+  editor.focus();
+  editor.setSelectionRange(8,8);
+  await user.keyboard('"');
+  expect(editor.value).toBe('A["label"]');
 });

@@ -10,7 +10,7 @@ export type PairedAsset = {
   data: string;
 };
 /** Where the stylesheet and asset index for a paired document came from. */
-export type PairState = { base: string; cssCompanion: boolean; assetsCompanion: boolean };
+export type PairState = { base: string; cssCompanion: boolean; assetsCompanion: boolean; locationId?: string };
 /** The complete file-group snapshot sent to the native paired writer. */
 export type PairedSnapshot = { source: string; css: string | null; assets: string | null };
 

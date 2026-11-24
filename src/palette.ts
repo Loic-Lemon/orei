@@ -40,10 +40,6 @@ export function paletteValues(css:string):Record<string,string> {
   const body=css.slice(rule.bodyStart,rule.bodyEnd).replace(/\/\*[\s\S]*?\*\//g, m=>' '.repeat(m.length));
   return Object.fromEntries([...body.matchAll(/(?:^|;)\s*([\w-]+)\s*:[ \t]*([^;]*)/g)].map(([,name,value])=>[name,value.trim()]));
 }
-export function paletteValue(css:string,name:string):string {
-  const values=paletteValues(css);
-  return Object.hasOwn(values,name)?values[name]:'';
-}
 export function rewritePalette(css:string,name:string,value:string):string|undefined {
   const rule=paletteRule(css);if(!rule||!/^--pele-[\w-]+$/.test(name)||/[;{}]/.test(value))return undefined;
   const body=css.slice(rule.bodyStart,rule.bodyEnd);

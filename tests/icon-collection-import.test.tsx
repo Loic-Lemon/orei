@@ -5,14 +5,16 @@ import {App} from '../src/App';
 import {ensureFixtures,seedFixtures} from './seed';
 
 const native=vi.hoisted(()=>({
-  open:vi.fn(),create:vi.fn(),write:vi.fn(),paired:vi.fn(),copy:vi.fn(),icon:vi.fn(),collection:vi.fn(),text:vi.fn(),exit:vi.fn(async()=>{}),
+  open:vi.fn(),prepare:vi.fn(),create:vi.fn(),write:vi.fn(),paired:vi.fn(),copy:vi.fn(),icon:vi.fn(),collection:vi.fn(),text:vi.fn(),exit:vi.fn(async()=>{}),
 }));
 vi.mock('@tauri-apps/api/core',()=>({invoke:vi.fn(async(command:string,args?:unknown)=>{
   if(command==='open_named_document')return native.open();
-  if(command==='create_named_document')return native.create(args);
-  if(command==='write_named_document')return native.write(args);
+  if(command==='prepare_markdown_destination')return native.prepare(args);
+  if(command==='create_markdown_document')return native.create(args);
+  if(command==='write_markdown_document')return {revision:await native.write(args),published:[]};
   if(command==='write_paired_document')return native.paired(args);
-  if(command==='save_document_copy')return native.copy(args);
+  if(command==='save_markdown_copy')return native.copy(args);
+  if(command==='cancel_markdown_destination')return true;
   if(command==='import_icon_file')return native.icon();
   if(command==='import_icon_collection_file')return native.collection();
   if(command==='copy_output_text')return native.text(args);
@@ -25,7 +27,7 @@ vi.mock('../src/rendering',()=>({renderDiagram:async()=>({svg:'<svg/>',width:100
 
 afterEach(()=>{
   cleanup();localStorage.clear();vi.restoreAllMocks();
-  native.open.mockReset();native.create.mockReset();native.write.mockReset();native.paired.mockReset();
+  native.open.mockReset();native.prepare.mockReset();native.create.mockReset();native.write.mockReset();native.paired.mockReset();
   native.copy.mockReset();native.icon.mockReset();native.collection.mockReset();native.text.mockReset();native.exit.mockReset();
   Reflect.deleteProperty(window,'__TAURI_INTERNALS__');
 });
@@ -39,7 +41,7 @@ const pack=(overrides:Record<string,unknown>={})=>JSON.stringify({
   aliases:{'dot-alias':{parent:'dot'}},
   ...overrides,
 });
-const start=()=>{ensureFixtures();Object.defineProperty(window,'__TAURI_INTERNALS__',{value:{},configurable:true});return render(<App/>);};
+const start=()=>{native.prepare.mockResolvedValue({destination:'collection-destination',attachments:'../attachments',namespace:'collection-destination'});ensureFixtures();Object.defineProperty(window,'__TAURI_INTERNALS__',{value:{},configurable:true});return render(<App/>);};
 const blankTab=()=>{fireEvent.click(screen.getByRole('button',{name:'New document'}));fireEvent.click(screen.getByRole('radio',{name:'Styling'}));};
 const collectionButton=()=>screen.getByRole('button',{name:'Import Iconify pack…'});
 const search=()=>screen.getByLabelText('Search icons');

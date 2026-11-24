@@ -1,24 +1,28 @@
 import { afterEach, expect, test, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import { App } from '../src/App';
 import {ensureFixtures,seedFixtures} from './seed';
+import { requestDocument, type NativeDocumentListener } from './native-document-request';
 import { defaultCSS } from '../src/fixtures';
 
 type Revisions = { source: number; css: number | null; assets: number | null };
-const native = vi.hoisted(() => ({ open: vi.fn(), write: vi.fn(), asset: vi.fn(), copy: vi.fn(), pairCopy: vi.fn() }));
+const native = vi.hoisted(() => ({ open: vi.fn(), restore: vi.fn(), write: vi.fn(), overwrite: vi.fn(), asset: vi.fn(), copy: vi.fn(), pairCopy: vi.fn(), release: vi.fn(), documentRequests: new Set<NativeDocumentListener>() }));
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(async (command: string, args?: unknown) => {
-    if (command === 'open_named_document') return native.open();
+    if (command === 'open_named_document') return native.open(args);
+    if (command === 'restore_paired_document') return native.restore(args);
     if (command === 'write_paired_document') return native.write(args);
+    if (command === 'overwrite_paired_document') return native.overwrite(args);
     if (command === 'read_paired_asset') return native.asset(args);
     if (command === 'write_named_document') return 2;
     if (command === 'save_document_copy') return native.copy(args);
     if (command === 'save_paired_copy') return native.pairCopy(args);
+    if (command === 'release_paired_document') return native.release(args);
     if (command === 'close_listener_ready') return false;
   }),
 }));
-vi.mock('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
+vi.mock('@tauri-apps/api/event', () => ({ listen: async (name: string, listener: NativeDocumentListener) => { if(name==='document-request'){native.documentRequests.add(listener);return()=>native.documentRequests.delete(listener);} return()=>{}; } }));
 vi.mock('../src/runner', () => ({ startRunner: vi.fn() }));
 vi.mock('../src/rendering', () => ({ renderDiagram: async () => ({ svg: '<svg/>', width: 100, height: 100 }) }));
 
@@ -26,10 +30,13 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   native.open.mockReset();
+  native.restore.mockReset();
   native.write.mockReset();
+  native.overwrite.mockReset();
   native.asset.mockReset();
   native.copy.mockReset();
   native.pairCopy.mockReset();
+  native.release.mockReset();
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__');
 });
 const start = () => { ensureFixtures(); Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true }); return render(<App />); };
@@ -209,16 +216,119 @@ test('embeds a newly read adjacent PNG into the index so the image reopens witho
   expect(index.assets['assets/new.png']).toEqual({ kind: 'image', mediaType: 'image/png', encoding: 'data-url', data: image });
 });
 
-test('restores a paired draft snapshot without claiming an active file session', () => {
+function seedRecoveredPair(locationId?: string, recoveredSource = source, cssCompanion = true) {
   localStorage.setItem('orei-drafts-v1', JSON.stringify({
-    documents: { 'diagram.mmd': { source, css, assets: {}, pair: { base: 'diagram', cssCompanion: true, assetsCompanion: false } } },
+    documents: { 'diagram.mmd': { source: recoveredSource, css, assets: {}, pair: { base: 'diagram', cssCompanion, assetsCompanion: false, locationId } } },
     active: 'diagram.mmd',
   }));
+}
+
+test('Save reconnects a legacy restored paired tab and writes only the new edit', async () => {
+  seedRecoveredPair();
+  native.open.mockResolvedValue(pair({ location_id: 'remembered-pair' }));
+  native.write.mockResolvedValue(saved({ source: 2, css: 1, assets: null }));
   start();
   expect(screen.getByLabelText('Diagram source')).toHaveValue(source);
-  expect(screen.getByLabelText('Diagram stylesheet')).toHaveValue(css);
-  expect(screen.getByText(/Paired diagram\.mmd with stylesheet companion/)).toBeInTheDocument();
+  const edited = source + '  C --> D\n';
+  fireEvent.change(screen.getByLabelText('Diagram source'), { target: { value: edited } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+  await waitFor(() => expect(native.write).toHaveBeenCalledWith({
+    handle: 'pair-1', expected: { source: 1, css: 1, assets: null }, source: edited, css, assets: null,
+  }));
+  expect(native.open).toHaveBeenCalledWith({ pairedName: 'diagram.mmd' });
+  expect(screen.queryByRole('dialog', { name: 'Could not save document' })).not.toBeInTheDocument();
   expect(screen.getByRole('tab',{name:'diagram.mmd'})).toHaveAttribute('aria-selected', 'true');
+  expect(within(screen.getByRole('tablist', { name: 'Document tabs' })).getAllByRole('tab')).toHaveLength(1);
+  expect(JSON.parse(localStorage.getItem('orei-drafts-v1')!).documents['diagram.mmd'].pair.locationId).toBe('remembered-pair');
+});
+
+test('a remembered paired tab reconnects on launch and resumes autosave without a picker', async () => {
+  seedRecoveredPair('remembered-pair');
+  native.restore.mockResolvedValue(pair({ location_id: 'remembered-pair' }));
+  native.write.mockResolvedValue(saved({ source: 2, css: 1, assets: null }));
+  start();
+  expect(await screen.findByText('Saved')).toBeInTheDocument();
+  expect(native.restore).toHaveBeenCalledWith({ locationId: 'remembered-pair' });
+  expect(native.open).not.toHaveBeenCalled();
+  expect(native.write).not.toHaveBeenCalled();
+
+  const edited = source + '  C --> D\n';
+  fireEvent.change(screen.getByLabelText('Diagram source'), { target: { value: edited } });
+  await waitFor(() => expect(native.write).toHaveBeenCalledWith(expect.objectContaining({ source: edited })), { timeout: 2500 });
+});
+
+test('reconnecting a paired tab with edits waits to save until recovery succeeds', async () => {
+  seedRecoveredPair();
+  native.open.mockResolvedValue(pair({ location_id: 'remembered-pair' }));
+  native.write.mockResolvedValue(saved({ source: 2, css: 1, assets: null }));
+  start();
+  const edited = source + '  C --> D\n';
+  fireEvent.change(screen.getByLabelText('Diagram source'), { target: { value: edited } });
+
+  const storage = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => { throw new Error('full'); });
+  try {
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Could not save document' });
+    expect(dialog).toHaveTextContent('Draft recovery failed');
+    await new Promise(resolve => setTimeout(resolve, 900));
+    expect(native.write).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole('button', { name: 'OK' }));
+  } finally { storage.mockRestore(); }
+
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  await waitFor(() => expect(native.write).toHaveBeenCalledWith(expect.objectContaining({ source: edited })));
+});
+
+test('a differing recovered pair waits for conflict resolution without writing either version', async () => {
+  const recovered = source + '  RECOVERED --> EDIT\n';
+  seedRecoveredPair('remembered-pair', recovered);
+  native.restore.mockResolvedValue(pair({ location_id: 'remembered-pair' }));
+  start();
+  expect(await screen.findByRole('dialog', { name: 'File changed on disk' })).toBeInTheDocument();
+  expect(screen.getByLabelText('Diagram source')).toHaveValue(recovered);
+  expect(screen.getByLabelText('Version on disk')).toHaveTextContent('Keep spacing');
+  expect(native.write).not.toHaveBeenCalled();
+  expect(native.open).not.toHaveBeenCalled();
+});
+
+test('a missing remembered location falls back to the picker and cancelling keeps the draft', async () => {
+  seedRecoveredPair('missing-pair');
+  native.restore.mockResolvedValue(null);
+  native.open.mockResolvedValueOnce(null).mockResolvedValueOnce(pair({ location_id: 'new-pair' }));
+  start();
+
+  await act(async () => fireEvent.click(screen.getByRole('button', { name: 'Save' })));
+  expect(native.open).toHaveBeenCalledTimes(1);
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+  expect(screen.getByLabelText('Diagram source')).toHaveValue(source);
+  expect(native.write).not.toHaveBeenCalled();
+
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  expect(await screen.findByText('Saved')).toBeInTheDocument();
+  expect(native.write).not.toHaveBeenCalled();
+});
+
+test('Keep Local adopts a stylesheet added on disk before the recovered pair reopens', async () => {
+  seedRecoveredPair('remembered-pair', source, false);
+  const addedCss = '.node { color: blue; }';
+  native.restore.mockResolvedValue(pair({ location_id: 'remembered-pair', css: addedCss }));
+  native.overwrite.mockResolvedValue({
+    ...saved({ source: 2, css: 1, assets: null }, ['source']),
+    untouched_companions: { css: addedCss, assets: null },
+  });
+  native.write.mockResolvedValue(saved({ source: 3, css: 2, assets: null }));
+  start();
+  const dialog = await screen.findByRole('dialog', { name: 'File changed on disk' });
+  fireEvent.click(within(dialog).getByRole('button', { name: /Keep Local/ }));
+  await waitFor(() => expect(screen.getByLabelText('Diagram stylesheet')).toHaveValue(addedCss));
+  expect(native.overwrite).toHaveBeenCalledWith(expect.objectContaining({ css: null, shown: expect.objectContaining({ css: addedCss }) }));
+
+  fireEvent.change(screen.getByLabelText('Diagram source'), { target: { value: source + '  C --> D\n' } });
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+  await waitFor(() => expect(native.write).toHaveBeenCalledWith(expect.objectContaining({
+    css: addedCss, expected: { source: 2, css: 1, assets: null },
+  })));
 });
 
 test('Save Copy offers paired files for a paired document and keeps its association', async () => {
@@ -227,7 +337,7 @@ test('Save Copy offers paired files for a paired document and keeps its associat
   start();
   fireEvent.click(screen.getByRole('button', { name: 'Open' }));
   await waitFor(() => expect(screen.getByLabelText('Diagram source')).toHaveValue(source));
-  fireEvent.click(screen.getByRole('button', { name: 'Save Copy' }));
+  await requestDocument(native.documentRequests, 'save-copy');
   expect(await screen.findByRole('dialog')).toHaveTextContent('Destination format');
   fireEvent.click(screen.getByRole('radio', { name: 'Paired Mermaid + CSS' }));
   fireEvent.click(screen.getByRole('button', { name: 'Save copy…' }));

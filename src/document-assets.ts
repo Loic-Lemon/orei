@@ -1,11 +1,7 @@
 // In-memory document asset map, shared by the renderer, the icon import flow, and
 // the paired-document codec. This module owns the `reference -> inline body` shape,
-// the icon/image classification, the immutable update helpers, and the standalone
-// Markdown save gate. The on-disk paired index lives in paired-document.ts; it uses
-// the same classification here and validates icon bodies through icon-safety.ts.
-// Standalone Markdown has no agreed representation for those bodies yet, so every
-// Markdown save path asks this module instead of assuming that writing the Mermaid
-// and CSS fences preserves them.
+// the icon/image classification and immutable update helpers. Markdown attachments
+// are planned in `markdown-assets.ts`; the paired index lives in `paired-document.ts`.
 export type DocumentAssets=Record<string,string>;
 
 export type AssetKind='icon'|'image'|'unknown';
@@ -36,22 +32,4 @@ export function addAsset(assets:DocumentAssets,reference:string,body:string):Doc
 export function removeAsset(assets:DocumentAssets,reference:string):DocumentAssets {
   if(!Object.hasOwn(assets,reference)) return assets;
   const next={...assets};delete next[reference];return next;
-}
-
-/**
- * Explains why a standalone Markdown save cannot carry the document's assets, or
- * returns undefined when the document is representable. Paired documents do not use
- * this gate: they embed their assets in the adjacent index instead. Kept pure so save
- * paths and tests can share the exact wording.
- */
-export function markdownAssetLimitation(assets:DocumentAssets):string|undefined {
-  const references=Object.keys(assets).sort();
-  if(!references.length) return undefined;
-  const sample=references.slice(0,3).join(', ')+(references.length>3?', …':'');
-  return `Markdown asset storage is not specified yet, so saving would lose ${references.length} embedded asset${references.length===1?'':'s'} (${sample}). Nothing was written and the assets remain in this draft's local recovery. Remove the imported assets from this document to save, or keep the draft until the Markdown asset mapping is finalized.`;
-}
-
-export function assertMarkdownAssetsRepresentable(assets:DocumentAssets):void {
-  const limitation=markdownAssetLimitation(assets);
-  if(limitation) throw new Error(limitation);
 }

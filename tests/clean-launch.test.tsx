@@ -2,8 +2,10 @@ import {afterEach,beforeAll,beforeEach,expect,test,vi} from 'vitest';
 import {cleanup,fireEvent,render,screen,waitFor,within} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import '@testing-library/jest-dom/vitest';
-import {App} from '../src/App';
+import {App,APP_THEME_KEY} from '../src/App';
+import {diagramSchemes} from '../src/diagram-presets';
 import {fixtures} from '../src/fixtures';
+import {paletteValues} from '../src/palette';
 import {DRAFTS_KEY, WORKSPACE_VERSION, WORKSPACE_VERSION_KEY} from '../src/workspace';
 
 vi.mock('../src/rendering',()=>({renderDiagram:async()=>({svg:'<svg><text>Clean</text></svg>',width:100,height:100})}));
@@ -23,10 +25,12 @@ test('clean launch opens one Untitled 1 with no sample assets or sample tabs',as
   expect(screen.getByLabelText('Diagram source')).toHaveValue('flowchart TD\n  A[Start] --> B[End]');
   const stored=JSON.parse(localStorage.getItem(DRAFTS_KEY)!).documents['Untitled 1'];
   expect(stored.assets).toEqual({});
+  expect(paletteValues(stored.css)).toMatchObject(diagramSchemes.paper.colors);
   expect(JSON.stringify(stored)).not.toContain('fixture:');
   await waitFor(()=>expect(screen.getAllByText('Current preview').length).toBeGreaterThan(0));
   const footer=document.querySelector('.status-bar')!;
   expect(footer.textContent).not.toMatch(/\d+ ms render/);
+  expect(screen.getByRole('radio',{name:'Responsive'})).toBeChecked();
 });
 
 test('saving a template as a draft completes recovery and clears the pending badge',async()=>{
@@ -84,7 +88,7 @@ test('the renderer starts on Preview and keeps the canvas when using Pele Docs',
   expect(previewTab).toHaveAttribute('aria-selected','true');
   expect(screen.getByRole('region',{name:'Preview canvas'})).toContainElement(preview);
   expect(preview.shadowRoot?.querySelector('svg')).toBe(svg);
-  expect(screen.getByRole('spinbutton',{name:'Preview zoom'})).toHaveValue(115);
+  expect(screen.getByRole('spinbutton',{name:'Preview zoom'})).toHaveValue(100);
   await user.click(docsTab);
   expect(screen.getByTitle('Pele documentation')).toBe(docs);
   expect(docs).toHaveAttribute('src','https://pele.run/theming');
@@ -101,22 +105,22 @@ test('evidence runs request samples explicitly without replacing normal drafts',
   expect(localStorage.getItem(DRAFTS_KEY)).toBe(normal);
 });
 
-test('document controls stay grouped and discoverable',()=>{
+test('document controls stay grouped and destination actions remain native menu commands',()=>{
   render(<App/>);
   expect(screen.getByRole('group',{name:'Document commands'})).toContainElement(screen.getByRole('button',{name:'New document'}));
   expect(screen.getByRole('group',{name:'New and save document'})).toContainElement(screen.getByRole('button',{name:'Open'}));
-  expect(screen.getByRole('group',{name:'Save to another destination'})).toContainElement(screen.getByRole('button',{name:'Save As'}));
-  for(const name of ['New document','Open','Save','Save As','Save Copy','Export'])expect(screen.getByRole('button',{name})).toBeInTheDocument();
+  for(const name of ['New document','Open','Save','Export'])expect(screen.getByRole('button',{name})).toBeInTheDocument();
+  for(const name of ['Save As','Save Copy'])expect(screen.queryByRole('button',{name})).not.toBeInTheDocument();
   // Quiet secondary commands share one variant; Save is the single solid command.
   expect(screen.getByRole('button',{name:'New document'}).className).toContain('rt-variant-ghost');
   expect(screen.getByRole('button',{name:'Open'}).className).toContain('rt-variant-ghost');
   expect(screen.getByRole('button',{name:'Save'}).className).toContain('rt-variant-solid');
-  expect(screen.getByRole('button',{name:'Save As'}).className).toContain('rt-variant-ghost');
-  expect(screen.getByRole('button',{name:'Save Copy'}).className).toContain('rt-variant-ghost');
-  // Appearance sits with the header settings, outside the command group, and remains reachable.
-  const settings=screen.getByLabelText('App appearance').closest('.toolbar-settings');
-  expect(settings).not.toBeNull();
-  expect(settings!.closest('.toolbar')).toBeNull();
+  expect(screen.getByText('orei').querySelector('svg')).toHaveAttribute('aria-hidden','true');
+  // Appearance and Settings live in the native app menu, not the workspace toolbar.
+  const toolbar=screen.getByRole('group',{name:'Document commands'});
+  expect(within(toolbar).queryByLabelText('App appearance')).not.toBeInTheDocument();
+  expect(within(toolbar).queryByRole('button',{name:'Settings'})).not.toBeInTheDocument();
+  expect(screen.queryByLabelText('App appearance')).not.toBeInTheDocument();
 });
 
 test('inactive tabs use quiet dots and hide routine status text from sight',async()=>{
@@ -164,7 +168,7 @@ test('zoom keeps raw typing until commit, steps by 5 and clamps',()=>{
   const preview=screen.getByTestId('preview');
   fireEvent.change(zoom,{target:{value:'15'}});
   expect(zoom).toHaveValue(15);
-  expect(preview).toHaveStyle({transform:'scale(1.15)'});
+  expect(preview).toHaveStyle({transform:'scale(1)'});
   fireEvent.keyDown(zoom,{key:'Enter'});
   expect(zoom).toHaveValue(25);
   expect(preview).toHaveStyle({transform:'scale(0.25)'});
@@ -186,13 +190,89 @@ test('zoom keeps raw typing until commit, steps by 5 and clamps',()=>{
   expect(zoom).toHaveValue(25);
 });
 
-test('color-scheme follows the selected app appearance and the preview is a region',async()=>{
+test('zoom buttons step immediately and fit returns to automatic zoom',async()=>{
   render(<App/>);
-  expect(document.documentElement.style.colorScheme).toBe('light');
+  const zoom=screen.getByRole('spinbutton',{name:'Preview zoom'});
+  const fit=screen.getByRole('button',{name:'Fit preview to pane width'});
+  await waitFor(()=>expect(screen.getByTestId('preview').shadowRoot?.querySelector('svg')).toBeTruthy());
+  expect(fit).toHaveAttribute('aria-pressed','true');
+  fireEvent.blur(zoom);
+  expect(fit).toHaveAttribute('aria-pressed','true');
+  fireEvent.click(screen.getByRole('button',{name:'Zoom in'}));
+  expect(zoom).toHaveValue(110);
+  expect(fit).toHaveAttribute('aria-pressed','false');
+  fireEvent.click(screen.getByRole('button',{name:'Zoom out'}));
+  expect(zoom).toHaveValue(100);
+  expect(fit).toHaveAttribute('aria-pressed','false');
+  fireEvent.click(screen.getByRole('button',{name:'Zoom out'}));
+  expect(zoom).toHaveValue(90);
+  fireEvent.click(fit);
+  expect(zoom).toHaveValue(100);
+  expect(fit).toHaveAttribute('aria-pressed','true');
+});
+
+test('legacy preview wheel keeps scrolling when one axis hits its limit',()=>{
+  vi.stubGlobal('CSS',{supports:()=>false});
+  try{
+    render(<App/>);
+    fireEvent.click(screen.getByRole('radio',{name:'Responsive'}));
+    const canvas=screen.getByRole('region',{name:'Preview canvas'});
+    Object.defineProperties(canvas,{
+      clientWidth:{value:300},scrollWidth:{value:300,configurable:true},
+      clientHeight:{value:300},scrollHeight:{value:500},
+    });
+
+    fireEvent.wheel(canvas,{deltaX:3,deltaY:40});
+    expect(canvas.scrollTop).toBe(40);
+    expect(canvas.scrollLeft).toBe(0);
+
+    Object.defineProperty(canvas,'scrollWidth',{value:500});
+    canvas.scrollTop=190;
+    fireEvent.wheel(canvas,{deltaX:20,deltaY:40});
+    expect(canvas.scrollTop).toBe(200);
+    expect(canvas.scrollLeft).toBe(20);
+
+    fireEvent.wheel(canvas,{shiftKey:true,deltaY:30});
+    expect(canvas.scrollLeft).toBe(50);
+    expect(canvas.scrollTop).toBe(200);
+
+    expect(fireEvent.wheel(canvas,{deltaX:10,deltaY:-30})).toBe(true);
+  }finally{vi.unstubAllGlobals();}
+});
+
+test('the app color scheme stays scoped to workspace surfaces, not the document root',async()=>{
+  localStorage.setItem(APP_THEME_KEY,'slate-dark');
+  render(<App/>);
+  expect(document.documentElement.style.colorScheme).toBe('');
   expect(screen.getByRole('region',{name:'Preview canvas'})).toBeInTheDocument();
-  fireEvent.click(screen.getByLabelText('App appearance'));
-  await screen.findByRole('listbox');
-  fireEvent.click([...screen.getAllByRole('option')].find(option=>option.textContent==='Dark')!);
-  await waitFor(()=>expect(document.documentElement.style.colorScheme).toBe('dark'));
+  const workspace=document.querySelector('.workspace')!;
+  expect(workspace).toHaveAttribute('data-appearance','dark');
+  expect(workspace.closest('.radix-themes')).toHaveClass('dark');
   expect(localStorage.getItem(WORKSPACE_VERSION_KEY)).toBe(WORKSPACE_VERSION);
+});
+
+test('recovered stylesheets are preserved instead of being replaced by the starter scheme',()=>{
+  const custom='.pele {\n  --pele-bg: #101820;\n  --pele-fg: #f0e6d2;\n}\n.note { color: tomato; }';
+  localStorage.setItem(DRAFTS_KEY,JSON.stringify({documents:{Recovered:{source:'flowchart LR\n A --> B',css:custom,assets:{}}},active:'Recovered'}));
+  localStorage.setItem(WORKSPACE_VERSION_KEY,WORKSPACE_VERSION);
+  render(<App/>);
+  expect(screen.getByLabelText('Diagram source')).toHaveValue('flowchart LR\n A --> B');
+  expect(screen.getByRole('radio',{name:'Styling'})).toBeInTheDocument();
+  fireEvent.click(screen.getByRole('radio',{name:'Styling'}));
+  expect(screen.getByLabelText('Diagram stylesheet')).toHaveValue(custom);
+  expect(paletteValues(custom)).not.toMatchObject(diagramSchemes.paper.colors);
+});
+
+test('choosing a diagram color scheme is one undo step and keeps unrelated CSS',async()=>{
+  render(<App/>);
+  fireEvent.click(screen.getByRole('radio',{name:'Styling'}));
+  const stylesheet=screen.getByLabelText('Diagram stylesheet') as HTMLTextAreaElement;
+  const original=stylesheet.value;
+  fireEvent.click(screen.getByLabelText('Color scheme'));
+  await screen.findByRole('listbox');
+  fireEvent.click(screen.getByRole('option',{name:/Dusk/}));
+  expect(stylesheet.value).toContain(diagramSchemes.dusk.colors['--pele-bg']);
+  expect(stylesheet.value).toContain('.pele');
+  fireEvent.click(screen.getByRole('button',{name:'Undo'}));
+  expect(stylesheet.value).toBe(original);
 });

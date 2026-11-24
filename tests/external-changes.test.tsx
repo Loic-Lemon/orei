@@ -3,36 +3,39 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-li
 import '@testing-library/jest-dom/vitest';
 import { App } from '../src/App';
 import {ensureFixtures,seedFixtures} from './seed';
+import { requestDocument, type NativeDocumentListener } from './native-document-request';
 import { createMarkdownDocument } from '../src/markdown-document';
 
 type Revisions = { source: number; css: number | null; assets: number | null };
 const native = vi.hoisted(() => ({
   open: vi.fn(), write: vi.fn(), inspect: vi.fn(), reload: vi.fn(), overwrite: vi.fn(), release: vi.fn(),
-  pairInspect: vi.fn(), pairReload: vi.fn(), pairOverwrite: vi.fn(), create: vi.fn(), copy: vi.fn(), pairCopy: vi.fn(),
+  pairInspect: vi.fn(), pairReload: vi.fn(), pairOverwrite: vi.fn(), prepare: vi.fn(), create: vi.fn(), copy: vi.fn(), pairCopy: vi.fn(), documentRequests: new Set<NativeDocumentListener>(),
 }));
 vi.mock('@tauri-apps/api/core', () => ({
   invoke: vi.fn(async (command: string, args?: unknown) => {
     switch (command) {
       case 'open_named_document': return native.open();
-      case 'write_named_document':
+      case 'write_markdown_document': return {revision:await native.write(args),published:[]};
       case 'write_paired_document': return native.write(args);
       case 'inspect_named_document': return native.inspect(args);
       case 'reload_named_document': return native.reload(args);
-      case 'overwrite_named_document': return native.overwrite(args);
+      case 'overwrite_markdown_document': return native.overwrite(args);
       case 'inspect_paired_document': return native.pairInspect(args);
       case 'reload_paired_document': return native.pairReload(args);
       case 'overwrite_paired_document': return native.pairOverwrite(args);
       case 'release_named_document':
       case 'release_paired_document': return native.release(args);
-      case 'create_named_document': return native.create(args);
-      case 'save_document_copy': return native.copy(args);
+      case 'prepare_markdown_destination': return native.prepare(args);
+      case 'create_markdown_document': return native.create(args);
+      case 'save_markdown_copy': return native.copy(args);
+      case 'cancel_markdown_destination': return true;
       case 'save_paired_copy': return native.pairCopy(args);
       case 'close_listener_ready': return false;
       default: return undefined;
     }
   }),
 }));
-vi.mock('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
+vi.mock('@tauri-apps/api/event', () => ({ listen: async (name: string, listener: NativeDocumentListener) => { if(name==='document-request'){native.documentRequests.add(listener);return()=>native.documentRequests.delete(listener);} return()=>{}; } }));
 vi.mock('../src/runner', () => ({ startRunner: vi.fn() }));
 vi.mock('../src/rendering', () => ({ renderDiagram: async () => ({ svg: '<svg/>', width: 100, height: 100 }) }));
 
@@ -40,10 +43,12 @@ beforeAll(() => { Element.prototype.scrollIntoView ??= () => {}; });
 afterEach(() => {
   cleanup();
   localStorage.clear();
-  for (const mock of Object.values(native)) mock.mockReset();
+  for (const mock of [native.open,native.write,native.inspect,native.reload,native.overwrite,native.release,native.pairInspect,native.pairReload,native.pairOverwrite,native.prepare,native.create,native.copy,native.pairCopy]) mock.mockReset();
+  native.documentRequests.clear();
+  native.prepare.mockResolvedValue({destination:'prepared-copy',attachments:'../attachments',namespace:'prepared-copy'});
   Reflect.deleteProperty(window, '__TAURI_INTERNALS__');
 });
-const start = () => { ensureFixtures(); Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true }); return render(<App/>); };
+const start = () => { native.prepare.mockResolvedValue({destination:'prepared-copy',attachments:'../attachments',namespace:'prepared-copy'}); ensureFixtures(); Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true }); return render(<App/>); };
 
 const markdown = (mermaid = 'graph TD\n', css = 'node { color: red; }\n') => createMarkdownDocument({ mermaid, css });
 const unchanged = { revision: 2, text: null, missing: false, changed: false, error: null, retained: [] };
@@ -289,9 +294,8 @@ test('Save As releases the previous handle, so the new path is the only one watc
   await openMarkdown();
   native.inspect.mockResolvedValue(unchanged);
   native.write.mockResolvedValue(3);
-  fireEvent.click(screen.getByRole('button', { name: 'Save As' }));
-  const created = markdown();
-  native.create.mockResolvedValue({ handle: 'doc-2', name: 'renamed.md', text: created, revision: 1 });
+  await requestDocument(native.documentRequests, 'save-as');
+  native.create.mockImplementation(async(args:{text:string})=>({ handle: 'doc-2', name: 'renamed.md', text: args.text, revision: 1 }));
   fireEvent.click(screen.getByRole('button', { name: 'Choose destination…' }));
   await waitFor(() => expect(screen.getByRole('tab',{name:'renamed.md'})).toHaveAttribute('aria-selected', 'true'));
   await waitFor(() => expect(native.release).toHaveBeenCalledWith({ handle: 'doc-1' }));

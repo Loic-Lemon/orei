@@ -1,22 +1,29 @@
 import { afterEach, beforeAll, beforeEach, expect, test, vi } from 'vitest';
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import { App } from '../src/App';
 import {ensureFixtures,seedDocument,seedFixtures} from './seed';
 import { defaultCSS } from '../src/fixtures';
 
-const native = vi.hoisted(() => ({ save: vi.fn(), write: vi.fn(), open: vi.fn() }));
+const native = vi.hoisted(() => ({ save: vi.fn(), write: vi.fn(), open: vi.fn(), settingsListeners: new Set<() => void>() }));
 vi.mock('@tauri-apps/plugin-dialog', () => ({ save: (options: unknown) => native.save(options) }));
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn(async (command: string, args?: { path: string; bytes: number[] }) => {
   if (command === 'save_output') return native.write(args);
   if (command === 'open_named_document') return native.open();
   if (command === 'close_listener_ready') return false;
 }) }));
-vi.mock('@tauri-apps/api/event', () => ({ listen: async () => () => {} }));
+vi.mock('@tauri-apps/api/event', () => ({ listen: async (name: string, listener: () => void) => {
+  if (name === 'settings-request') { native.settingsListeners.add(listener); return () => native.settingsListeners.delete(listener); }
+  return () => {};
+} }));
 vi.mock('../src/runner', () => ({ startRunner: vi.fn() }));
 
 beforeAll(() => { Element.prototype.scrollIntoView ??= () => {}; });
-beforeEach(() => { native.save.mockReset(); native.write.mockReset(); native.open.mockReset(); });
+beforeEach(() => {
+  native.save.mockReset(); native.write.mockReset(); native.open.mockReset(); native.settingsListeners.clear();
+  Object.defineProperty(window, '__TAURI_INTERNALS__', { value: {}, configurable: true });
+  localStorage.removeItem('orei-app-theme');
+});
 afterEach(() => { cleanup(); Reflect.deleteProperty(window, '__TAURI_INTERNALS__'); });
 
 const start = async () => {
@@ -33,6 +40,14 @@ const choose = async (label:string, option:string) => {
   fireEvent.click(screen.getByLabelText(label));
   await screen.findByRole('listbox');
   fireEvent.click([...screen.getAllByRole('option')].find(e => e.textContent === option)!);
+};
+const chooseAppearance = async (name:string) => {
+  await waitFor(() => expect(native.settingsListeners.size).toBeGreaterThan(0));
+  act(() => { for (const listener of native.settingsListeners) listener(); });
+  const settings = await screen.findByRole('dialog', { name: 'Settings' });
+  fireEvent.click(within(settings).getByRole('radio', { name: new RegExp(name) }));
+  fireEvent.click(within(settings).getByRole('button', { name: 'Done' }));
+  await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
 };
 const savedBytes = () => new TextDecoder().decode(new Uint8Array(native.write.mock.calls[0][0].bytes));
 
@@ -51,13 +66,13 @@ test('Save SVG offers the native destination and writes the current composition 
 
 test('the canvas appearance follows the app theme by default, overrides independently, and exports the authored background', async () => {
   const color = '#f3ece2';
+  const css = defaultCSS.replace('#ffffff', color);
   seedDocument('Canvas test', {
     source: 'flowchart LR\n  A --> B',
-    css: defaultCSS.replace('#ffffff', color),
+    css,
     assets: {},
   });
-  // jsdom has no matchMedia; a stub lets this test simulate operating-system
-  // appearance changes while the app appearance select is set to System.
+  // jsdom has no matchMedia, so simulate system appearance changes.
   const system = { dark: false, listeners: new Set<() => void>() };
   vi.stubGlobal('matchMedia', (query: string) => ({
     get matches() { return system.dark; },
@@ -70,9 +85,11 @@ test('the canvas appearance follows the app theme by default, overrides independ
   try {
     await start();
     const canvas = screen.getByRole('region', { name: 'Preview canvas' });
+    const appTheme = canvas.closest('.radix-themes');
     const preview = screen.getByTestId('preview').shadowRoot!;
     const diagram = preview.querySelector('svg');
-    expect(canvas).toHaveAttribute('data-canvas-appearance', 'light');
+    expect(canvas).toHaveAttribute('data-canvas-appearance', 'app');
+    expect(appTheme).toHaveClass('light');
     expect(canvas.style.getPropertyValue('--document-canvas')).toBe(color);
     expect(preview.querySelector('style')?.textContent)
       .toContain('svg > [data-orei-canvas] { display: none; }');
@@ -80,30 +97,42 @@ test('the canvas appearance follows the app theme by default, overrides independ
     // Match app (default): a System appearance change re-resolves the backdrop
     // without re-rendering the diagram.
     system.dark = true; flipSystem();
-    expect(canvas).toHaveAttribute('data-canvas-appearance', 'dark');
-    expect(document.documentElement.style.colorScheme).toBe('dark');
+    expect(canvas).toHaveAttribute('data-canvas-appearance', 'app');
+    expect(appTheme).toHaveClass('dark');
+    expect(document.querySelector('.workspace')).toHaveAttribute('data-appearance','dark');
+    expect(document.documentElement.style.colorScheme).toBe('');
     expect(preview.querySelector('svg')).toBe(diagram);
+    expect(screen.getByLabelText('Diagram stylesheet')).toHaveValue(css);
 
     // An explicit choice overrides the app theme.
     await choose('Canvas appearance', 'Document');
     expect(canvas).toHaveAttribute('data-canvas-appearance', 'document');
     expect(canvas.style.getPropertyValue('--document-canvas')).toBe(color);
     system.dark = false; flipSystem();
-    expect(document.documentElement.style.colorScheme).toBe('light');
+    expect(document.querySelector('.workspace')).toHaveAttribute('data-appearance','light');
     expect(canvas).toHaveAttribute('data-canvas-appearance', 'document');
     await choose('Canvas appearance', 'Light');
     expect(canvas).toHaveAttribute('data-canvas-appearance', 'light');
-    await choose('App appearance', 'Dark');
+    await chooseAppearance('Slate Dark');
     expect(canvas).toHaveAttribute('data-canvas-appearance', 'light');
     expect(preview.querySelector('svg')).toBe(diagram);
-    await choose('App appearance', 'Light');
+    expect(screen.getByLabelText('Diagram stylesheet')).toHaveValue(css);
+    await chooseAppearance('Light');
 
     // Restoring Match app follows the app appearance again.
     await choose('Canvas appearance', 'Match app');
-    expect(canvas).toHaveAttribute('data-canvas-appearance', 'light');
-    await choose('App appearance', 'Dark');
-    expect(canvas).toHaveAttribute('data-canvas-appearance', 'dark');
-    await choose('App appearance', 'Light');
+    expect(canvas).toHaveAttribute('data-canvas-appearance', 'app');
+    expect(appTheme).toHaveClass('light');
+    await chooseAppearance('Slate Dark');
+    expect(canvas).toHaveAttribute('data-canvas-appearance', 'app');
+    expect(appTheme).toHaveAttribute('data-gray-color', 'slate');
+    await chooseAppearance('Ink Dark');
+    expect(canvas).toHaveAttribute('data-canvas-appearance', 'app');
+    expect(appTheme).toHaveAttribute('data-gray-color', 'gray');
+    await chooseAppearance('Warm Dark');
+    expect(canvas).toHaveAttribute('data-canvas-appearance', 'app');
+    expect(appTheme).toHaveAttribute('data-gray-color', 'sand');
+    await chooseAppearance('Light');
     expect(preview.querySelector('svg')).toBe(diagram);
 
     await openExport();
@@ -135,12 +164,7 @@ test('exporting is zoom and pan independent: the same composition is saved at an
   expect(zoomed).toContain('Ordinary label');
 });
 
-test('exported output is isolated from the app theme: switching appearance changes nothing', async () => {
-  const choose = async (label:string, option:string) => {
-    fireEvent.click(screen.getByLabelText(label));
-    await screen.findByRole('listbox');
-    fireEvent.click([...screen.getAllByRole('option')].find(e => e.textContent === option)!);
-  };
+test('a fresh render under a different app theme exports the same diagram', async () => {
   await start();
   native.save.mockResolvedValue('/tmp/diagram.svg');
   await openExport();
@@ -148,7 +172,14 @@ test('exported output is isolated from the app theme: switching appearance chang
   await waitFor(() => expect(native.write).toHaveBeenCalledOnce());
   const light = savedBytes();
 
-  await choose('App appearance', 'Dark');
+  await chooseAppearance('Warm Dark');
+  const source = screen.getByLabelText<HTMLTextAreaElement>('Diagram source');
+  const original = source.value;
+  const preview = screen.getByTestId('preview').shadowRoot!;
+  fireEvent.change(source, { target: { value: `${original}\n  X[Theme isolation probe]` } });
+  await waitFor(() => expect(preview.textContent).toContain('Theme isolation probe'));
+  fireEvent.change(source, { target: { value: original } });
+  await waitFor(() => expect(preview.textContent).not.toContain('Theme isolation probe'));
   await openExport();
   native.save.mockResolvedValue('/tmp/diagram-2.svg');
   fireEvent.click(screen.getByRole('button', { name: 'Save SVG' }));

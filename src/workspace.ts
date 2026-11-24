@@ -16,7 +16,7 @@ export const WORKSPACE_VERSION='2';
 const BLANK_SOURCE='flowchart TD\n  A[Start] --> B[End]';
 const STARTER_CSS=`.pele {
   --pele-font: sans-serif;
-${Object.entries(diagramSchemes.graphite.colors).map(([name,color])=>`  ${name}: ${color};`).join('\n')}
+${Object.entries(diagramSchemes.paper.colors).map(([name,color])=>`  ${name}: ${color};`).join('\n')}
 }`;
 
 export function blankDocument(source=BLANK_SOURCE):DraftDocument {
@@ -61,7 +61,7 @@ function readWorkspace(raw:string,legacyActive:string|null):StoredWorkspace {
     if(!value || typeof value!=='object' || Array.isArray(value))return false;
     const doc=value as DraftDocument;
     const markdown=doc.originalMarkdown===undefined || (typeof doc.originalMarkdown==='string' && (()=>{try { parseMarkdownDocument(doc.originalMarkdown); return true; } catch { return false; }})());
-    // A restored paired document keeps its in-memory association only; it reconnects by reopening.
+    // The native location key is optional so older drafts still restore and can be reconnected.
     const pair=doc.pair===undefined || (validPair(doc.pair) && doc.originalMarkdown===undefined);
     return typeof doc.source==='string' && typeof doc.css==='string' && !!doc.assets && typeof doc.assets==='object' && !Array.isArray(doc.assets) && Object.values(doc.assets).every(asset=>typeof asset==='string') && markdown && pair;
   });

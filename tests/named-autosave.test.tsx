@@ -6,7 +6,7 @@ import {ensureFixtures,seedFixtures} from './seed';
 import {createMarkdownDocument} from '../src/markdown-document';
 
 const native=vi.hoisted(()=>({open:vi.fn(),write:vi.fn()}));
-vi.mock('@tauri-apps/api/core',()=>({invoke:vi.fn(async(command:string,args?:{handle:string;revision:number;text:string})=>command==='open_named_document'?native.open():command==='write_named_document'?native.write(args):false)}));
+vi.mock('@tauri-apps/api/core',()=>({invoke:vi.fn(async(command:string,args?:{handle:string;revision:number;text:string})=>command==='open_named_document'?native.open():command==='write_markdown_document'?{revision:await native.write(args),published:[]}:false)}));
 vi.mock('@tauri-apps/api/event',()=>({listen:async()=>()=>{}}));
 vi.mock('../src/runner',()=>({startRunner:vi.fn()}));
 vi.mock('../src/rendering',()=>({renderDiagram:async()=>({svg:'<svg/>',width:100,height:100})}));

@@ -1,4 +1,4 @@
-import { useId, useMemo, useRef, useState, type ReactNode, type Ref } from 'react';
+import { useId, useMemo, useRef, useState, type ClipboardEventHandler, type ReactNode, type Ref } from 'react';
 import { TextArea } from '@radix-ui/themes';
 
 type CodeEditorLanguage = 'mermaid' | 'css';
@@ -8,7 +8,8 @@ type CodeEditorProps = {
   language: CodeEditorLanguage;
   label: string;
   value: string;
-  onChange: (value: string) => void;
+  onChange: (value: string, caret: number) => void;
+  onPaste?: ClipboardEventHandler<HTMLTextAreaElement>;
 };
 
 type TokenRule = { source: string; className: string; punctuation?: RegExp };
@@ -75,7 +76,7 @@ function highlight(code: string, language: CodeEditorLanguage): ReactNode[] {
   return nodes;
 }
 
-export function CodeEditor({ ref, language, label, value, onChange }: CodeEditorProps) {
+export function CodeEditor({ ref, language, label, value, onChange, onPaste }: CodeEditorProps) {
   const gutter = useRef<HTMLSpanElement>(null);
   const layer = useRef<HTMLSpanElement>(null);
   const help = useId();
@@ -97,7 +98,8 @@ export function CodeEditor({ ref, language, label, value, onChange }: CodeEditor
         value={value}
         spellCheck={false}
         wrap="off"
-        onChange={event=>onChange(event.target.value)}
+        onChange={event=>onChange(event.currentTarget.value, event.currentTarget.selectionEnd)}
+        onPaste={onPaste}
         onCompositionStart={()=>setComposing(true)}
         onCompositionEnd={()=>setComposing(false)}
         onBlur={()=>setComposing(false)}

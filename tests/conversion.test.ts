@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest';
-import { defaultDestinationName, documentFormat, planConversion, sameConversion } from '../src/conversion';
-import { createMarkdownDocument } from '../src/markdown-document';
+import { defaultDestinationName, documentFormat, planConversion } from '../src/conversion';
+import { createMarkdownDocument, updateMarkdownDocument } from '../src/markdown-document';
 
 const icon = '<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h10v10z"/></svg>';
 const image = 'data:image/png;base64,iVBORw0KGgo=';
@@ -42,50 +42,49 @@ test('Markdown to paired carries every icon name and image data URL into the adj
   expect(index.assets['assets/local.png']).toEqual({ kind: 'image', mediaType: 'image/png', encoding: 'data-url', data: image });
 });
 
-test('paired to Markdown preserves surrounding Markdown when the source already is a note', () => {
+test('Markdown to Markdown plans the format only once the existing envelope validates', () => {
   const envelope = createMarkdownDocument({ mermaid: 'old mermaid\n', css: '.old { color: blue; }\n' });
-  const document = markdownDocument({
-    originalMarkdown: `# Note\n\nKeep this paragraph.\n\n${envelope}\nTail text.\n`,
+  const document = markdownDocument({ originalMarkdown: `# Note\n\nKeep this paragraph.\n\n${envelope}\nTail text.\n` });
+  expect(planConversion(document, 'markdown')).toEqual({ format: 'markdown' });
+});
+
+test('updating a note preserves surrounding Markdown and replaces only the Mermaid and CSS blocks', () => {
+  const envelope = createMarkdownDocument({ mermaid: 'old mermaid\n', css: '.old { color: blue; }\n' });
+  const document = markdownDocument({ originalMarkdown: `# Note\n\nKeep this paragraph.\n\n${envelope}\nTail text.\n` });
+  const text = updateMarkdownDocument(document.originalMarkdown, { mermaid: document.source, css: document.css });
+  expect(text).toContain('Keep this paragraph.');
+  expect(text).toContain('Tail text.');
+  expect(text).toContain('flowchart LR\n  A --> B\n');
+  expect(text).toContain('.node { color: red; }');
+  expect(text).not.toContain('.old { color: blue; }');
+});
+
+test('Markdown composition builds a new note when there is no existing envelope', () => {
+  const document = pairedDocument();
+  expect(planConversion(document, 'markdown')).toEqual({ format: 'markdown' });
+  const text = createMarkdownDocument({ mermaid: document.source, css: document.css });
+  expect(text).toContain('```mermaid\nflowchart LR\n  A --> B\n```');
+  expect(text).toContain('<!-- orei:css:start -->');
+  expect(text).toContain('```css\n.node { color: red; }\n```');
+});
+
+test('Markdown composition keeps image and icon references for the attachments folder', () => {
+  const document = pairedDocument({
+    source: 'flowchart LR\n  A@{ icon: "fixture:star" }\n  B@{ img: "assets/local.png" }\n',
+    assets: { 'fixture:star': icon, 'assets/local.png': image },
   });
-  const conversion = planConversion(document, 'markdown');
-  expect(conversion.format).toBe('markdown');
-  if (conversion.format !== 'markdown') throw new Error('expected markdown');
-  expect(conversion.text).toContain('Keep this paragraph.');
-  expect(conversion.text).toContain('Tail text.');
-  expect(conversion.text).toContain('flowchart LR\n  A --> B\n');
-  expect(conversion.text).toContain('.node { color: red; }');
-  expect(conversion.text).not.toContain('.old { color: blue; }');
+  expect(planConversion(document, 'markdown')).toEqual({ format: 'markdown' });
+  const text = createMarkdownDocument({ mermaid: document.source, css: document.css });
+  expect(text).toContain('@{ icon: "fixture:star" }');
+  expect(text).toContain('@{ img: "assets/local.png" }');
 });
 
-test('paired to Markdown builds a new note when there is no existing Markdown envelope', () => {
-  const conversion = planConversion(pairedDocument(), 'markdown');
-  expect(conversion.format).toBe('markdown');
-  if (conversion.format !== 'markdown') throw new Error('expected markdown');
-  expect(conversion.text).toContain('```mermaid\nflowchart LR\n  A --> B\n```');
-  expect(conversion.text).toContain('<!-- orei:css:start -->');
-  expect(conversion.text).toContain('```css\n.node { color: red; }\n```');
-});
-
-test('paired to Markdown refuses documents with icon definitions or embedded images through the shared gate', () => {
-  expect(() => planConversion(pairedDocument({
-    source: 'flowchart LR\n  A@{ icon: "fixture:star" }\n',
-    assets: { 'fixture:star': icon },
-  }), 'markdown')).toThrow(/Markdown asset storage is not specified yet.*fixture:star/);
-  expect(() => planConversion(pairedDocument({
-    source: 'flowchart LR\n  A@{ icon: "fixture:star" }\n',
-    assets: { 'fixture:star': icon },
-  }), 'markdown')).toThrow(/remain in this draft's local recovery/);
-
-  expect(() => planConversion(pairedDocument({
-    source: 'flowchart LR\n  A@{ img: "assets/local.png" }\n',
-    assets: { 'assets/local.png': image },
-  }), 'markdown')).toThrow(/1 embedded asset \(assets\/local\.png\)/);
-});
-
-test('paired to Markdown refuses unresolved local image references kept as source text', () => {
-  expect(() => planConversion(pairedDocument({
-    source: 'flowchart LR\n  A@{ img: "assets/missing.png" }\n',
-  }), 'markdown')).toThrow(/local image reference assets\/missing\.png cannot be resolved/);
+test('Markdown composition preserves unresolved local image reference text', () => {
+  const document = pairedDocument({ source: 'flowchart LR\n  A@{ img: "assets/missing.png" }\n' });
+  // Composition never resolves assets, so a missing body passes through inside the fence;
+  // only the paired destination rejects it.
+  expect(planConversion(document, 'markdown')).toEqual({ format: 'markdown' });
+  expect(createMarkdownDocument({ mermaid: document.source, css: document.css })).toContain('@{ img: "assets/missing.png" }');
 });
 
 test('paired to paired refuses references whose image content is not embedded', () => {
@@ -125,24 +124,16 @@ test('paired to paired preserves the index when every reference is embedded and 
   expect(JSON.parse(emptyCompanion.snapshot.assets!)).toEqual({ format: 'orei-paired-assets', version: 1, assets: {} });
 });
 
-test('Markdown to Markdown preserves an image reference because the representation already carries it', () => {
+test('Markdown composition preserves an image reference because the note itself carries it', () => {
   const document = markdownDocument({ source: 'flowchart LR\n  A@{ img: "assets/local.png" }\n' });
-  const conversion = planConversion(document, 'markdown');
-  expect(conversion.format).toBe('markdown');
-  if (conversion.format !== 'markdown') throw new Error('expected markdown');
-  expect(conversion.text).toContain('assets/local.png');
+  expect(planConversion(document, 'markdown')).toEqual({ format: 'markdown' });
+  const text = updateMarkdownDocument(document.originalMarkdown, { mermaid: document.source, css: document.css });
+  expect(text).toContain('assets/local.png');
 });
 
-test('a malformed Markdown envelope fails conversion without producing a destination', () => {
-  expect(() => planConversion(markdownDocument({ originalMarkdown: 'no fences here' }), 'markdown')).toThrow();
-});
-
-test('conversion comparison distinguishes content changes', () => {
-  const document = markdownDocument();
-  const planned = planConversion(document, 'paired');
-  expect(sameConversion(planned, planConversion(document, 'paired'))).toBe(true);
-  expect(sameConversion(planned, planConversion({ ...document, source: 'graph TD\n' }, 'paired'))).toBe(false);
-  expect(sameConversion(planned, planConversion(document, 'markdown'))).toBe(false);
+test('a malformed Markdown envelope fails planning before a destination exists', () => {
+  expect(() => planConversion(markdownDocument({ originalMarkdown: 'no fences here' }), 'markdown'))
+    .toThrow(/Missing, duplicate, or malformed CSS markers/);
 });
 
 test('format detection and default destination names follow the document, not a stored preference', () => {

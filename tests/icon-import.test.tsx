@@ -5,13 +5,16 @@ import {App} from '../src/App';
 import {ensureFixtures,seedFixtures} from './seed';
 import {createMarkdownDocument} from '../src/markdown-document';
 
-const native=vi.hoisted(()=>({open:vi.fn(),create:vi.fn(),write:vi.fn(),paired:vi.fn(),copy:vi.fn(),icon:vi.fn(),exit:vi.fn(async()=>{}),close:undefined as (()=>void)|undefined}));
+const native=vi.hoisted(()=>({open:vi.fn(),prepare:vi.fn(),create:vi.fn(),write:vi.fn(),paired:vi.fn(),copy:vi.fn(),icon:vi.fn(),exit:vi.fn(async()=>{}),close:undefined as (()=>void)|undefined}));
 vi.mock('@tauri-apps/api/core',()=>({invoke:vi.fn(async(command:string,args?:unknown)=>{
   if(command==='open_named_document')return native.open();
-  if(command==='create_named_document')return native.create(args);
-  if(command==='write_named_document')return native.write(args);
+  if(command==='prepare_markdown_destination')return native.prepare(args);
+  if(command==='create_markdown_document')return native.create(args);
+  if(command==='write_markdown_document')return {revision:await native.write(args),published:[]};
   if(command==='write_paired_document')return native.paired(args);
-  if(command==='save_document_copy')return native.copy(args);
+  if(command==='save_markdown_copy')return native.copy(args);
+  if(command==='choose_markdown_attachments')return '../attachments';
+  if(command==='cancel_markdown_destination')return true;
   if(command==='import_icon_file')return native.icon();
   if(command==='close_listener_ready')return false;
   if(command==='exit_after_recovery')return native.exit();
@@ -25,14 +28,14 @@ vi.mock('../src/rendering',()=>({renderDiagram:async()=>({svg:'<svg/>',width:100
 
 afterEach(()=>{
   cleanup();localStorage.clear();vi.restoreAllMocks();
-  native.open.mockReset();native.create.mockReset();native.write.mockReset();native.paired.mockReset();native.copy.mockReset();native.icon.mockReset();native.exit.mockReset();
+  native.open.mockReset();native.prepare.mockReset();native.create.mockReset();native.write.mockReset();native.paired.mockReset();native.copy.mockReset();native.icon.mockReset();native.exit.mockReset();
   native.close=undefined;
   Reflect.deleteProperty(window,'__TAURI_INTERNALS__');
 });
 
 const car='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></svg>';
 const van='<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 20"><path d="M1 1h30v18H1z"/></svg>';
-const start=()=>{ensureFixtures();Object.defineProperty(window,'__TAURI_INTERNALS__',{value:{},configurable:true});return render(<App/>);};
+const start=()=>{native.prepare.mockResolvedValue({destination:'icon-destination',attachments:'../attachments',namespace:'icon-destination'});ensureFixtures();Object.defineProperty(window,'__TAURI_INTERNALS__',{value:{},configurable:true});return render(<App/>);};
 const blankTab=()=>{fireEvent.click(screen.getByRole('button',{name:'New document'}));fireEvent.click(screen.getByRole('radio',{name:'Styling'}));};
 const importButton=()=>screen.getByRole('button',{name:'Import SVG…'});
 const library=()=>screen.getByLabelText('Imported icons');
@@ -98,7 +101,7 @@ test('a naming collision is explicit and preserves the original icon body',async
   expect(within(library()).getAllByText('custom:car',{selector:'code'})).toHaveLength(1);
 });
 
-test('first Save is refused while imported icons exist and succeeds after they are removed',async()=>{
+test('first Save writes imported icons as Markdown attachments',async()=>{
   native.icon.mockResolvedValue({name:'car.svg',text:car});
   native.create.mockImplementation(async({text}:{text:string})=>({handle:'handle-icon',name:'note.md',text,revision:1}));
   native.write.mockResolvedValue(2);
@@ -107,22 +110,21 @@ test('first Save is refused while imported icons exist and succeeds after they a
   fireEvent.click(importButton());
   await waitFor(()=>expect(within(library()).getByText('custom:car',{selector:'code'})).toBeInTheDocument());
   fireEvent.click(screen.getByRole('button',{name:'Save'}));
-  expect(await screen.findByRole('dialog')).toHaveTextContent('Markdown asset storage is not specified yet');
-  expect(screen.getByRole('dialog')).toHaveTextContent("draft's local recovery");
-  expect(native.create).not.toHaveBeenCalled();
-  fireEvent.click(screen.getByRole('button',{name:'OK'}));
-  expect(storedAssets()).toHaveProperty('custom:car');
+  await waitFor(()=>expect(native.create).toHaveBeenCalledOnce());
+  expect(native.create.mock.calls[0][0].files).toEqual(expect.arrayContaining([expect.objectContaining({kind:'icon',data:expect.stringContaining('<svg')})]));
+  expect(native.create.mock.calls[0][0].text).toContain('orei:assets:v1');
+  expect(JSON.parse(localStorage.getItem('orei-drafts-v1')!).documents['note.md'].assets).toHaveProperty('custom:car');
   expect(screen.getByLabelText('Diagram source')).toHaveValue('flowchart LR\n  A-->B\n');
 
   fireEvent.click(screen.getByRole('button',{name:'Remove icon custom:car'}));
-  expect(storedAssets()).toEqual({});
+  expect(JSON.parse(localStorage.getItem('orei-drafts-v1')!).documents['note.md'].assets).toEqual({});
   fireEvent.click(screen.getByRole('button',{name:'Save'}));
   await waitFor(()=>expect(native.create).toHaveBeenCalledOnce());
   expect(native.create.mock.calls[0][0].text).toContain('A-->B');
   await waitFor(()=>expect(screen.getByRole('tab',{name:'note.md'})).toHaveAttribute('aria-selected','true'));
 });
 
-test('importing into an opened file pauses autosave instead of dropping the icon',async()=>{
+test('importing into an opened Markdown file autosaves the icon attachment',async()=>{
   const markdown=createMarkdownDocument({mermaid:'graph TD\n',css:'node { color: red; }\n'});
   native.open.mockResolvedValue({handle:'handle-open',name:'named.md',text:markdown,revision:3});
   native.icon.mockResolvedValue({name:'car.svg',text:car});
@@ -133,15 +135,13 @@ test('importing into an opened file pauses autosave instead of dropping the icon
   fireEvent.click(screen.getByRole('radio',{name:'Styling'}));
   fireEvent.click(importButton());
   await waitFor(()=>expect(within(library()).getByText('custom:car',{selector:'code'})).toBeInTheDocument());
-  fireEvent.click(screen.getByRole('button',{name:'OK'}));
-  expect(screen.getByText('Save paused')).toBeInTheDocument();
   fireEvent.change(screen.getByLabelText('Diagram source'),{target:{value:'graph TD\n  A-->B\n'}});
-  await act(async()=>{await new Promise(resolve=>setTimeout(resolve,900));});
-  expect(native.write).not.toHaveBeenCalled();
+  await waitFor(()=>expect(native.write).toHaveBeenCalledOnce(),{timeout:2500});
+  expect(native.write.mock.calls[0][0].files).toEqual(expect.arrayContaining([expect.objectContaining({kind:'icon'})]));
 
   fireEvent.click(screen.getByRole('button',{name:'Remove icon custom:car'}));
   fireEvent.change(screen.getByLabelText('Diagram source'),{target:{value:'graph TD\n  A-->C\n'}});
-  await waitFor(()=>expect(native.write).toHaveBeenCalled(),{timeout:2500});
+  await waitFor(()=>expect(native.write).toHaveBeenCalledTimes(2),{timeout:2500});
   expect(native.write.mock.calls.at(-1)![0].text).toContain('A-->C');
 });
 

@@ -3,20 +3,24 @@ import {afterEach,expect,test,vi} from 'vitest';
 import '@testing-library/jest-dom/vitest';
 import {App} from '../src/App';
 import {ensureFixtures,seedFixtures} from './seed';
+import { requestDocument, type NativeDocumentListener } from './native-document-request';
 import {createMarkdownDocument} from '../src/markdown-document';
 
 type Opened={handle:string;name:string;text:string;revision:number};
-const native=vi.hoisted(()=>({open:vi.fn(),create:vi.fn(),write:vi.fn(),copy:vi.fn(),exit:vi.fn(async()=>{}),close:undefined as (()=>void)|undefined}));
+const native=vi.hoisted(()=>({open:vi.fn(),prepare:vi.fn(async()=>({destination:'destination-1',attachments:'../attachments',namespace:'destination-1'})),create:vi.fn(),write:vi.fn(),copy:vi.fn(),exit:vi.fn(async()=>{}),close:undefined as (()=>void)|undefined,documentRequests:new Set<NativeDocumentListener>()}));
 vi.mock('@tauri-apps/api/core',()=>({invoke:vi.fn(async(command:string,args?:unknown)=>{
   if(command==='open_named_document')return native.open();
-  if(command==='create_named_document')return native.create(args);
-  if(command==='write_named_document')return native.write(args);
-  if(command==='save_document_copy')return native.copy(args);
+  if(command==='prepare_markdown_destination')return native.prepare();
+  if(command==='create_markdown_document')return native.create(args);
+  if(command==='write_markdown_document')return {revision:await native.write(args),published:[]};
+  if(command==='save_markdown_copy')return native.copy(args);
+  if(command==='cancel_markdown_destination')return true;
   if(command==='close_listener_ready')return false;
   if(command==='exit_after_recovery')return native.exit();
 })}));
 vi.mock('@tauri-apps/api/event',()=>({listen:async(name:string,listener:()=>void)=>{
   if(name==='window-close-request'){native.close=listener;return()=>{native.close=undefined;};}
+  if(name==='document-request'){native.documentRequests.add(listener as NativeDocumentListener);return()=>native.documentRequests.delete(listener as NativeDocumentListener);}
   return()=>{};
 }}));
 vi.mock('../src/runner',()=>({startRunner:vi.fn()}));
@@ -24,12 +28,12 @@ vi.mock('../src/rendering',()=>({renderDiagram:async()=>({svg:'<svg/>',width:100
 
 afterEach(()=>{
   cleanup();localStorage.clear();
-  native.open.mockReset();native.create.mockReset();native.write.mockReset();native.copy.mockReset();native.exit.mockReset();
+  native.open.mockReset();native.prepare.mockReset();native.create.mockReset();native.write.mockReset();native.copy.mockReset();native.exit.mockReset();
   native.close=undefined;
   Reflect.deleteProperty(window,'__TAURI_INTERNALS__');
 });
 
-const start=()=>{ensureFixtures();Object.defineProperty(window,'__TAURI_INTERNALS__',{value:{},configurable:true});return render(<App/>);};
+const start=()=>{native.prepare.mockResolvedValue({destination:'destination-1',attachments:'../attachments',namespace:'destination-1'});ensureFixtures();Object.defineProperty(window,'__TAURI_INTERNALS__',{value:{},configurable:true});return render(<App/>);};
 const source=()=>screen.getByLabelText('Diagram source');
 const markdown=createMarkdownDocument({mermaid:'graph TD\n',css:'node { color: red; }\n'});
 
@@ -160,7 +164,7 @@ test('Save Copy stays independent of the first-save association',async()=>{
   fireEvent.click(screen.getByRole('button',{name:'New document'}));
   fireEvent.click(screen.getByRole('button',{name:'Save'}));
   await waitFor(()=>expect(screen.getByRole('tab',{name:'source.md'})).toBeInTheDocument());
-  fireEvent.click(screen.getByRole('button',{name:'Save Copy'}));
+  await requestDocument(native.documentRequests,'save-copy');
   fireEvent.click(screen.getByRole('button',{name:'Save copy…'}));
   await waitFor(()=>expect(native.copy).toHaveBeenCalledOnce());
   expect(native.copy.mock.calls[0][0].text).toContain('<!-- orei:css:start -->');

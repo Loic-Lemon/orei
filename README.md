@@ -14,6 +14,10 @@ A macOS editor for Mermaid diagrams powered by [Pele](https://pele.run/).
 - Use built-in Lucide icons and import SVG icons, Iconify packs, or local PNGs.
 - Export SVG or PNG, or copy the PNG image or SVG markup.
 
+## What's in a note
+
+A saved Markdown note is an ordinary `.md` file that Obsidian can edit and render. It contains a standard Mermaid fenced block, a CSS block marked with `<!-- orei:css:start -->` and `<!-- orei:css:end -->`, and a single `<!-- orei:assets:v1 {...} -->` manifest that maps the note's icon and image references to sidecar files under a user-chosen attachments folder.
+
 ## Build on macOS
 
 Requires Node.js 24 with npm, Rust, and Xcode Command Line Tools (`xcode-select --install`).
@@ -41,6 +45,16 @@ open /Applications/orei.app
 ```
 
 You can then find **orei** in Finder or Spotlight.
+
+## Development
+
+Run the frontend tests, the Rust tests, and the app in development mode:
+
+```sh
+npm test
+cargo test --locked --manifest-path src-tauri/Cargo.toml
+npm run tauri -- dev
+```
 
 ## License
 

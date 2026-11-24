@@ -9,7 +9,10 @@ mod document_io;
 mod icon_io;
 mod image_io;
 mod menu;
+mod markdown_assets;
+mod markdown_roots;
 mod pair_io;
+mod pair_locations;
 
 #[tauri::command]
 async fn open_document(app: tauri::AppHandle) -> Result<Option<(String, String)>, String> {
@@ -59,24 +62,280 @@ async fn import_icon_collection_file(app: tauri::AppHandle) -> Result<Option<ico
     }).await.map_err(|e| e.to_string())?
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct MarkdownPreferences {
+    default_notes_folder: Option<String>,
+    default_attachments_folder: Option<String>,
+}
+
+fn preferences_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(app.path().app_config_dir().map_err(|e| e.to_string())?.join("preferences.json"))
+}
+
+fn roots_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_config_dir().ok().map(|dir| dir.join("attachment-roots.json"))
+}
+
+/// Reads and writes of approval memory are best-effort: a full disk must never make a note
+/// unsavable, and a missing entry only costs one folder confirmation.
+fn recall_root(app: &tauri::AppHandle, note: &std::path::Path) -> Option<std::path::PathBuf> {
+    markdown_roots::recall(&roots_path(app)?, note)
+}
+
+fn remember_root(app: &tauri::AppHandle, note: &std::path::Path, root: &std::path::Path) {
+    if let Some(path) = roots_path(app) { let _ = markdown_roots::remember(&path, note, root); }
+}
+
+fn refresh_root(app: &tauri::AppHandle, note: &std::path::Path) {
+    if let Some(path) = roots_path(app) { let _ = markdown_roots::refresh(&path, note); }
+}
+
 #[tauri::command]
-async fn open_named_document(app: tauri::AppHandle, registry: tauri::State<'_, Mutex<document_io::Registry>>, pairs: tauri::State<'_, Mutex<pair_io::PairRegistry>>) -> Result<Option<serde_json::Value>, String> {
+fn get_markdown_preferences(app: tauri::AppHandle) -> Result<MarkdownPreferences, String> {
+    let path = preferences_path(&app)?;
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(MarkdownPreferences::default()),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[tauri::command]
+fn set_markdown_preferences(app: tauri::AppHandle, preferences: MarkdownPreferences) -> Result<(), String> {
+    let path = preferences_path(&app)?;
+    let parent = path.parent().ok_or("Invalid preferences path")?;
+    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(&preferences).map_err(|e| e.to_string())?;
+    let temporary = path.with_extension("json.tmp");
+    std::fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(temporary, path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn pick_folder(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        app.dialog().file().blocking_pick_folder().map(|folder| folder.into_path().map(|path| path.to_string_lossy().into_owned()).map_err(|e| e.to_string())).transpose()
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn prepare_markdown_destination(app: tauri::AppHandle, assets: tauri::State<'_, Mutex<markdown_assets::Registry>>, default_name: String, needs_attachments: bool, override_attachments: bool) -> Result<Option<markdown_assets::PreparedDestination>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let preferences = get_markdown_preferences(app.clone())?;
+    let suggested = dialog_name(&default_name, "md", "Untitled");
+    let selected = tauri::async_runtime::spawn_blocking(move || -> Result<Option<(std::path::PathBuf, std::path::PathBuf)>, String> {
+        let mut picker = app.dialog().file().add_filter("Markdown document", &["md"]).set_file_name(&suggested);
+        if let Some(folder) = preferences.default_notes_folder.as_deref().filter(|folder| std::path::Path::new(folder).is_dir()) {
+            picker = picker.set_directory(folder);
+        }
+        let Some(selected) = picker.blocking_save_file() else { return Ok(None) };
+        let note = selected.into_path().map_err(|error| error.to_string())?;
+        let default_root = preferences.default_attachments_folder.as_deref().filter(|folder| std::path::Path::new(folder).is_dir()).map(std::path::PathBuf::from);
+        let root = if !needs_attachments {
+            default_root.unwrap_or_else(|| note.parent().unwrap_or(std::path::Path::new(".")).to_owned())
+        } else if !override_attachments {
+            if let Some(root) = default_root { root } else {
+                let mut folder_picker = app.dialog().file();
+                if let Some(parent) = note.parent() { folder_picker = folder_picker.set_directory(parent); }
+                let Some(folder) = folder_picker.blocking_pick_folder() else { return Ok(None) };
+                folder.into_path().map_err(|error| error.to_string())?
+            }
+        } else {
+            let mut folder_picker = app.dialog().file();
+            if let Some(folder) = default_root.as_deref() { folder_picker = folder_picker.set_directory(folder); }
+            else if let Some(parent) = note.parent() { folder_picker = folder_picker.set_directory(parent); }
+            let Some(folder) = folder_picker.blocking_pick_folder() else { return Ok(None) };
+            folder.into_path().map_err(|error| error.to_string())?
+        };
+        Ok(Some((note, root)))
+    }).await.map_err(|error| error.to_string())??;
+    let Some((note, root)) = selected else { return Ok(None) };
+    assets.lock().map_err(|error| error.to_string())?.prepare(&note, &root).map(Some)
+}
+
+#[tauri::command]
+async fn choose_markdown_attachments(app: tauri::AppHandle, assets: tauri::State<'_, Mutex<markdown_assets::Registry>>, registry: tauri::State<'_, Mutex<document_io::Registry>>, handle: String, override_attachments: bool) -> Result<Option<String>, String> {
+    if !override_attachments && assets.lock().map_err(|error| error.to_string())?.root(&handle).is_some() {
+        return Ok(None);
+    }
+    let note = registry.lock().map_err(|error| error.to_string())?.path(&handle)?;
+    let picker_note = note.clone();
+    let remembered = recall_root(&app, &note);
+    let preferences = get_markdown_preferences(app.clone())?;
+    let dialog_app = app.clone();
+    let root = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        let mut picker = dialog_app.dialog().file();
+        if let Some(folder) = remembered {
+            picker = picker.set_directory(folder);
+        } else if let Some(folder) = preferences.default_attachments_folder.as_deref().filter(|folder| std::path::Path::new(folder).is_dir()) {
+            picker = picker.set_directory(folder);
+        } else if let Some(parent) = picker_note.parent() { picker = picker.set_directory(parent); }
+        picker.blocking_pick_folder().map(|folder| folder.into_path().map_err(|error| error.to_string())).transpose()
+    }).await.map_err(|error| error.to_string())??;
+    let Some(root) = root else { return Ok(None) };
+    let parent = note.parent().ok_or("Invalid document location")?;
+    let relative = markdown_assets::relative_attachment_path(parent, &root)?;
+    assets.lock().map_err(|error| error.to_string())?.set_root(&handle, &root)?;
+    remember_root(&app, &note, &root);
+    Ok(Some(relative))
+}
+
+#[tauri::command]
+fn cancel_markdown_destination(assets: tauri::State<'_, Mutex<markdown_assets::Registry>>, destination: String) -> Result<bool, String> {
+    Ok(assets.lock().map_err(|error| error.to_string())?.cancel_destination(&destination))
+}
+
+#[tauri::command]
+fn create_markdown_document(app: tauri::AppHandle, assets: tauri::State<'_, Mutex<markdown_assets::Registry>>, registry: tauri::State<'_, Mutex<document_io::Registry>>, destination: String, text: String, files: Vec<markdown_assets::AssetFile>) -> Result<document_io::OpenDocument, String> {
+    let mut assets = assets.lock().map_err(|error| error.to_string())?;
+    let (path, root) = assets.destination(&destination)?;
+    document_io::check_new_destination(&path, &text)?;
+    if !files.is_empty() { markdown_assets::publish(&root, &files)?; }
+    let mut registry = registry.lock().map_err(|error| error.to_string())?;
+    let opened = document_io::create_and_authorize(&mut registry, &path, &text)?;
+    assets.finish_destination(&destination, Some(&opened.handle))?;
+    drop(assets);
+    remember_root(&app, &path, &root);
+    Ok(opened)
+}
+
+#[tauri::command]
+fn save_markdown_copy(app: tauri::AppHandle, assets: tauri::State<'_, Mutex<markdown_assets::Registry>>, destination: String, text: String, files: Vec<markdown_assets::AssetFile>) -> Result<bool, String> {
+    let mut assets = assets.lock().map_err(|error| error.to_string())?;
+    let (path, root) = assets.destination(&destination)?;
+    document_io::check_new_destination(&path, &text)?;
+    if !files.is_empty() { markdown_assets::publish(&root, &files)?; }
+    document_io::create_copy(&path, &text)?;
+    assets.finish_destination(&destination, None)?;
+    drop(assets);
+    remember_root(&app, &path, &root);
+    Ok(true)
+}
+
+#[tauri::command]
+fn write_markdown_document(app: tauri::AppHandle, assets: tauri::State<'_, Mutex<markdown_assets::Registry>>, registry: tauri::State<'_, Mutex<document_io::Registry>>, handle: String, revision: u64, text: String, files: Vec<markdown_assets::AssetFile>) -> Result<markdown_assets::MarkdownWrite, String> {
+    let assets = assets.lock().map_err(|error| error.to_string())?;
+    let mut registry = registry.lock().map_err(|error| error.to_string())?;
+    let note = registry.path(&handle)?;
+    let write = if !files.is_empty() {
+        let root = assets.root(&handle).ok_or("Choose an attachments folder in the native Markdown destination flow first")?;
+        registry.check_write(&handle, revision, &text)?;
+        let published = markdown_assets::publish(&root, &files)?;
+        let revision = registry.write(&handle, revision, &text)?;
+        markdown_assets::MarkdownWrite { revision, published }
+    } else {
+        let revision = registry.write(&handle, revision, &text)?;
+        markdown_assets::MarkdownWrite { revision, published: Vec::new() }
+    };
+    refresh_root(&app, &note);
+    Ok(write)
+}
+
+#[tauri::command]
+fn overwrite_markdown_document(app: tauri::AppHandle, assets: tauri::State<'_, Mutex<markdown_assets::Registry>>, registry: tauri::State<'_, Mutex<document_io::Registry>>, handle: String, text: String, shown: Option<String>, files: Vec<markdown_assets::AssetFile>) -> Result<serde_json::Value, String> {
+    let assets = assets.lock().map_err(|error| error.to_string())?;
+    let mut registry = registry.lock().map_err(|error| error.to_string())?;
+    let note = registry.path(&handle)?;
+    registry.check_overwrite(&handle, &text)?;
+    let published = if files.is_empty() { Vec::new() } else {
+        let root = assets.root(&handle).ok_or("Choose an attachments folder in the native Markdown destination flow first")?;
+        markdown_assets::publish(&root, &files)?
+    };
+    let outcome = registry.overwrite(&handle, &text, shown.as_deref())?;
+    refresh_root(&app, &note);
+    let mut value = serde_json::to_value(outcome).map_err(|error| error.to_string())?;
+    value["published"] = serde_json::to_value(published).map_err(|error| error.to_string())?;
+    Ok(value)
+}
+
+#[tauri::command]
+async fn read_markdown_assets(app: tauri::AppHandle, assets: tauri::State<'_, Mutex<markdown_assets::Registry>>, registry: tauri::State<'_, Mutex<document_io::Registry>>, handle: String, references: Vec<markdown_assets::AssetReference>, allow_prompt: bool) -> Result<Option<Vec<markdown_assets::ResolvedAsset>>, String> {
+    if references.is_empty() { return Ok(Some(Vec::new())); }
+    let note = registry.lock().map_err(|error| error.to_string())?.path(&handle)?;
+    // A live root is an approval from this process. A remembered root is only permission to
+    // read: it is never installed as a write root, so a stale entry cannot redirect a save.
+    let live = assets.lock().map_err(|error| error.to_string())?.root(&handle);
+    let mut root = live.or_else(|| recall_root(&app, &note));
+    let authorized = match root.as_deref() {
+        Some(root) => markdown_assets::references_within_root(&note, root, &references)?,
+        None => false,
+    };
+    if !authorized {
+        if !allow_prompt {
+            // Background inspection never opens a native picker. A named error keeps the
+            // existing conflict path in the app instead of a modal dialog.
+            return Err("The attachments folder for this note is not known on this machine. Open the note again to choose it.".into());
+        }
+        let suggestion = root.clone().or_else(|| note.parent().map(std::path::Path::to_path_buf));
+        let dialog_app = app.clone();
+        let selected = tauri::async_runtime::spawn_blocking(move || {
+            use tauri_plugin_dialog::DialogExt;
+            let mut picker = dialog_app.dialog().file();
+            if let Some(folder) = suggestion { picker = picker.set_directory(folder); }
+            picker.blocking_pick_folder()
+                .map(|folder| folder.into_path().map_err(|error| error.to_string())).transpose()
+        }).await.map_err(|error| error.to_string())??;
+        let Some(selected) = selected else { return Ok(None) };
+        assets.lock().map_err(|error| error.to_string())?.set_root(&handle, &selected)?;
+        remember_root(&app, &note, &selected);
+        root = Some(selected);
+    }
+    let root = root.ok_or("Attachment folder is not authorized")?;
+    markdown_assets::read_authorized(&note, &root, &references).map(Some)
+}
+
+#[tauri::command]
+fn markdown_root_ready(assets: tauri::State<'_, Mutex<markdown_assets::Registry>>, handle: String) -> Result<bool, String> {
+    Ok(assets.lock().map_err(|error| error.to_string())?.root(&handle).is_some())
+}
+
+fn pair_locations_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    app.path().app_config_dir().ok().map(|path| path.join("paired-locations.json"))
+}
+
+#[tauri::command]
+fn restore_paired_document(app: tauri::AppHandle, pairs: tauri::State<'_, Mutex<pair_io::PairRegistry>>, location_id: String) -> Result<Option<pair_io::OpenPair>, String> {
+    let mut pairs = pairs.lock().map_err(|e| e.to_string())?;
+    let Some(path) = pair_locations_path(&app).and_then(|store| pair_locations::recall(&store, &location_id)) else { return Ok(None) };
+    let mut opened = pairs.authorize(path)?;
+    opened.location_id = Some(location_id);
+    Ok(Some(opened))
+}
+
+#[tauri::command]
+async fn open_named_document(app: tauri::AppHandle, registry: tauri::State<'_, Mutex<document_io::Registry>>, pairs: tauri::State<'_, Mutex<pair_io::PairRegistry>>, markdown: tauri::State<'_, Mutex<markdown_assets::Registry>>, paired_name: Option<String>) -> Result<Option<serde_json::Value>, String> {
+    let store = pair_locations_path(&app);
+    let paired_only = paired_name.is_some();
     let Some(path) = tauri::async_runtime::spawn_blocking(move || {
         use tauri_plugin_dialog::DialogExt;
-        app.dialog().file().add_filter("Diagram document", &["md", "mmd"]).blocking_pick_file()
+        let picker = app.dialog().file();
+        let picker = match paired_name {
+            Some(name) => picker.set_title("Choose the original Mermaid file")
+                .set_file_name(dialog_name(&name, "mmd", "Diagram"))
+                .add_filter("Mermaid diagram", &["mmd"]),
+            None => picker.add_filter("Diagram document", &["md", "mmd"]),
+        };
+        picker.blocking_pick_file()
             .map(|selected| selected.into_path().map_err(|e| e.to_string()))
     }).await.map_err(|e| e.to_string())? else { return Ok(None) };
     let path = path?;
     let extension = path.extension().and_then(|value| value.to_str()).map(|value| value.to_ascii_lowercase());
     match extension.as_deref() {
         Some("mmd") => {
-            let opened = pairs.lock().map_err(|e| e.to_string())?.authorize(path)?;
+            let mut pairs = pairs.lock().map_err(|e| e.to_string())?;
+            let mut opened = pairs.authorize(path.clone())?;
+            opened.location_id = store.and_then(|store| pair_locations::remember(&store, &path, &opened.handle));
             serde_json::to_value(opened).map(Some).map_err(|e| e.to_string())
         }
-        Some("md") => {
+        Some("md") if !paired_only => {
             let opened = registry.lock().map_err(|e| e.to_string())?.authorize(path)?;
+            markdown.lock().map_err(|e| e.to_string())?.authorize_open(&opened.handle);
             serde_json::to_value(opened).map(Some).map_err(|e| e.to_string())
         }
+        _ if paired_only => Err("Choose the original .mmd file to reconnect this tab.".into()),
         _ => Err("Expected a .md or .mmd document".into()),
     }
 }
@@ -112,8 +371,10 @@ fn overwrite_named_document(registry: tauri::State<'_, Mutex<document_io::Regist
 }
 
 #[tauri::command]
-fn release_named_document(registry: tauri::State<'_, Mutex<document_io::Registry>>, handle: String) -> Result<bool, String> {
-    Ok(registry.lock().map_err(|e| e.to_string())?.release(&handle))
+fn release_named_document(registry: tauri::State<'_, Mutex<document_io::Registry>>, markdown: tauri::State<'_, Mutex<markdown_assets::Registry>>, handle: String) -> Result<bool, String> {
+    let released = registry.lock().map_err(|e| e.to_string())?.release(&handle);
+    markdown.lock().map_err(|e| e.to_string())?.forget(&handle);
+    Ok(released)
 }
 
 #[tauri::command]
@@ -152,6 +413,7 @@ async fn create_named_document(app: tauri::AppHandle, registry: tauri::State<'_,
 #[tauri::command]
 async fn create_paired_destination(app: tauri::AppHandle, pairs: tauri::State<'_, Mutex<pair_io::PairRegistry>>, source: String, css: String, assets: Option<String>, default_name: String) -> Result<Option<pair_io::OpenPair>, String> {
     let suggested = dialog_name(&default_name, "mmd", "Untitled");
+    let store = pair_locations_path(&app);
     let Some(path) = tauri::async_runtime::spawn_blocking(move || {
         use tauri_plugin_dialog::DialogExt;
         app.dialog().file().add_filter("Mermaid diagram", &["mmd"]).set_file_name(&suggested).blocking_save_file()
@@ -159,7 +421,9 @@ async fn create_paired_destination(app: tauri::AppHandle, pairs: tauri::State<'_
     }).await.map_err(|e| e.to_string())? else { return Ok(None) };
     let path = path?;
     let mut pairs = pairs.lock().map_err(|e| e.to_string())?;
-    pairs.create(path, &source, &css, assets.as_deref()).map(Some)
+    let mut opened = pairs.create(path.clone(), &source, &css, assets.as_deref())?;
+    opened.location_id = store.and_then(|store| pair_locations::remember(&store, &path, &opened.handle));
+    Ok(Some(opened))
 }
 
 #[tauri::command]
@@ -297,8 +561,8 @@ fn set_copy_enabled(app:tauri::AppHandle,enabled:bool)->Result<(),String>{
 fn main() {
     START.set(Instant::now()).ok();
     let _ = evidence_event(serde_json::json!({"type":"boundary","name":"native-main"}));
-    tauri::Builder::default().manage(Mutex::new(close_state::CloseState::default())).manage(Mutex::new(document_io::Registry::default())).manage(Mutex::new(pair_io::PairRegistry::default())).plugin(tauri_plugin_dialog::init()).plugin(tauri_plugin_clipboard_manager::init())
-        .invoke_handler(tauri::generate_handler![evidence_context,evidence_event,evidence_artifact,evidence_resize,set_export_enabled,set_edit_enabled,save_output,copy_output_image,copy_output_text,set_copy_enabled,open_document,save_document_copy,save_paired_copy,open_named_document,create_named_document,create_paired_destination,write_named_document,write_paired_document,inspect_named_document,reload_named_document,overwrite_named_document,release_named_document,inspect_paired_document,reload_paired_document,overwrite_paired_document,release_paired_document,read_paired_asset,import_icon_file,import_icon_collection_file,import_image_file,close_listener_ready,exit_after_recovery,cancel_close])
+    tauri::Builder::default().manage(Mutex::new(close_state::CloseState::default())).manage(Mutex::new(document_io::Registry::default())).manage(Mutex::new(pair_io::PairRegistry::default())).manage(Mutex::new(markdown_assets::Registry::default())).plugin(tauri_plugin_dialog::init()).plugin(tauri_plugin_clipboard_manager::init())
+        .invoke_handler(tauri::generate_handler![evidence_context,evidence_event,evidence_artifact,evidence_resize,set_export_enabled,set_edit_enabled,get_markdown_preferences,set_markdown_preferences,pick_folder,prepare_markdown_destination,choose_markdown_attachments,cancel_markdown_destination,create_markdown_document,save_markdown_copy,write_markdown_document,overwrite_markdown_document,read_markdown_assets,markdown_root_ready,save_output,copy_output_image,copy_output_text,set_copy_enabled,open_document,save_document_copy,save_paired_copy,open_named_document,restore_paired_document,create_named_document,create_paired_destination,write_named_document,write_paired_document,inspect_named_document,reload_named_document,overwrite_named_document,release_named_document,inspect_paired_document,reload_paired_document,overwrite_paired_document,release_paired_document,read_paired_asset,import_icon_file,import_icon_collection_file,import_image_file,close_listener_ready,exit_after_recovery,cancel_close])
         // The app-wide menu is installed before the first window exists, and its items are
         // managed here so the enablement commands can resolve nested File/Edit handles.
         .menu(menu::build)

@@ -3,16 +3,20 @@ import {afterEach,expect,test,vi} from 'vitest';
 import '@testing-library/jest-dom/vitest';
 import {App} from '../src/App';
 import {ensureFixtures,seedFixtures} from './seed';
+import { requestDocument, type NativeDocumentListener } from './native-document-request';
 import {createMarkdownDocument} from '../src/markdown-document';
 import {pngDataUrl} from './png-fixture';
 
-const native=vi.hoisted(()=>({open:vi.fn(),create:vi.fn(),write:vi.fn(),paired:vi.fn(),copy:vi.fn(),pairCopy:vi.fn(),image:vi.fn(),asset:vi.fn(),exit:vi.fn(async()=>{}),close:undefined as (()=>void)|undefined}));
+const native=vi.hoisted(()=>({open:vi.fn(),prepare:vi.fn(),create:vi.fn(),write:vi.fn(),paired:vi.fn(),copy:vi.fn(),pairCopy:vi.fn(),image:vi.fn(),asset:vi.fn(),exit:vi.fn(async()=>{}),close:undefined as (()=>void)|undefined,documentRequests:new Set<NativeDocumentListener>()}));
 vi.mock('@tauri-apps/api/core',()=>({invoke:vi.fn(async(command:string,args?:unknown)=>{
   if(command==='open_named_document')return native.open();
-  if(command==='create_named_document')return native.create(args);
-  if(command==='write_named_document')return native.write(args);
+  if(command==='prepare_markdown_destination')return native.prepare(args);
+  if(command==='create_markdown_document')return native.create(args);
+  if(command==='write_markdown_document')return {revision:await native.write(args),published:[]};
   if(command==='write_paired_document')return native.paired(args);
-  if(command==='save_document_copy')return native.copy(args);
+  if(command==='save_markdown_copy')return native.copy(args);
+  if(command==='choose_markdown_attachments')return '../attachments';
+  if(command==='cancel_markdown_destination')return true;
   if(command==='save_paired_copy')return native.pairCopy(args);
   if(command==='read_paired_asset')return native.asset(args);
   if(command==='import_image_file')return native.image();
@@ -21,6 +25,7 @@ vi.mock('@tauri-apps/api/core',()=>({invoke:vi.fn(async(command:string,args?:unk
 })}));
 vi.mock('@tauri-apps/api/event',()=>({listen:async(name:string,listener:()=>void)=>{
   if(name==='window-close-request'){native.close=listener;return()=>{native.close=undefined;};}
+  if(name==='document-request'){native.documentRequests.add(listener as NativeDocumentListener);return()=>native.documentRequests.delete(listener as NativeDocumentListener);}
   return()=>{};
 }}));
 vi.mock('../src/runner',()=>({startRunner:vi.fn()}));
@@ -28,12 +33,12 @@ vi.mock('../src/rendering',()=>({renderDiagram:async()=>({svg:'<svg/>',width:100
 
 afterEach(()=>{
   cleanup();localStorage.clear();vi.restoreAllMocks();
-  native.open.mockReset();native.create.mockReset();native.write.mockReset();native.paired.mockReset();native.copy.mockReset();native.pairCopy.mockReset();native.image.mockReset();native.asset.mockReset();native.exit.mockReset();
+  native.open.mockReset();native.prepare.mockReset();native.create.mockReset();native.write.mockReset();native.paired.mockReset();native.copy.mockReset();native.pairCopy.mockReset();native.image.mockReset();native.asset.mockReset();native.exit.mockReset();
   native.close=undefined;
   Reflect.deleteProperty(window,'__TAURI_INTERNALS__');
 });
 
-const start=()=>{ensureFixtures();Object.defineProperty(window,'__TAURI_INTERNALS__',{value:{},configurable:true});return render(<App/>);};
+const start=()=>{native.prepare.mockResolvedValue({destination:'image-destination',attachments:'../attachments',namespace:'image-destination'});ensureFixtures();Object.defineProperty(window,'__TAURI_INTERNALS__',{value:{},configurable:true});return render(<App/>);};
 const blankTab=()=>{fireEvent.click(screen.getByRole('button',{name:'New document'}));fireEvent.click(screen.getByRole('radio',{name:'Styling'}));fireEvent.change(screen.getByLabelText('Diagram source'),{target:{value:'flowchart LR\n  A --> B\n'}});};
 const source=()=>screen.getByLabelText('Diagram source') as HTMLTextAreaElement;
 const importButton=()=>screen.getByRole('button',{name:'Import PNG…'});
@@ -49,10 +54,12 @@ test('a rejected image import leaves the document intact when draft recovery can
   native.image.mockResolvedValue({name:'Beach Photo.png',data:pngDataUrl(8,8)});
   start();blankTab();
   const before=localStorage.getItem('orei-drafts-v1');
+  const previousSource=source().value;
   const setItem=vi.spyOn(Storage.prototype,'setItem').mockImplementation(()=>{throw new Error('full');});
   fireEvent.click(importButton());
   await waitFor(()=>expect(screen.getByRole('alert')).toHaveTextContent('draft recovery is unavailable'));
   expect(screen.queryByLabelText('Local images')).not.toBeInTheDocument();
+  expect(source()).toHaveValue(previousSource);
   setItem.mockRestore();
   expect(storedAssets()).toEqual({});
   expect(before).toContain('"Untitled 1"');
@@ -64,11 +71,38 @@ test('imports a selected PNG, inserts its diagram reference, and records the dat
   start();blankTab();
   fireEvent.click(importButton());
   await waitFor(()=>expect(screen.getByText(/Imported Beach Photo\.png and inserted/)).toBeInTheDocument());
-  expect(source()).toHaveValue('flowchart LR\n  A --> B\n@{ img: "Beach Photo.png" }');
+  expect(source()).toHaveValue('flowchart LR\n  A --> B\nimage1@{ img: "Beach Photo.png", w: 8, h: 8, constraint: "on" }');
   expect(within(library()).getByText('Beach Photo.png',{selector:'code'})).toBeInTheDocument();
-  expect(within(library()).getByText('@{ img: "Beach Photo.png" }')).toBeInTheDocument();
+  expect(within(library()).getByText('@{ img: "Beach Photo.png", w: 8, h: 8, constraint: "on" }')).toBeInTheDocument();
   expect(storedAssets()).toEqual({'Beach Photo.png':data});
   expect(screen.getByLabelText('Image reference')).toHaveValue('');
+});
+
+test('pasting a PNG adds a sized node and recovers its data in Styling',async()=>{
+  start();blankTab();fireEvent.click(screen.getByRole('radio',{name:'Diagram'}));
+  const data=pngDataUrl(480,240);
+  const file=new File([Uint8Array.from(atob(data.split(',')[1]),byte=>byte.charCodeAt(0))],'clip.png',{type:'image/png'});
+  const editor=source();
+  editor.setSelectionRange(editor.value.length,editor.value.length);
+  fireEvent.paste(editor,{clipboardData:{items:[{kind:'file',type:'image/png',getAsFile:()=>file}],files:[file]}});
+  await waitFor(()=>expect(source()).toHaveValue('flowchart LR\n  A --> B\nimage1@{ img: "pasted-image.png", w: 240, h: 120, constraint: "on" }'));
+  fireEvent.paste(editor,{clipboardData:{files:[file]}});
+  await waitFor(()=>expect(source().value).toContain('\nimage2@{ img: "pasted-image-2.png", w: 240, h: 120, constraint: "on" }'));
+  expect(storedAssets()).toEqual({'pasted-image.png':data,'pasted-image-2.png':data});
+  expect(fireEvent.paste(editor,{clipboardData:{items:[{kind:'string',type:'text/plain'}]}})).toBe(true);
+  fireEvent.click(screen.getByRole('radio',{name:'Styling'}));
+  expect(within(library()).getByText('pasted-image.png',{selector:'code'})).toBeInTheDocument();
+  expect(within(library()).getByText('@{ img: "pasted-image.png", w: 240, h: 120, constraint: "on" }')).toBeInTheDocument();
+});
+
+test('rejecting a clipboard PNG leaves the source and assets intact',async()=>{
+  start();blankTab();fireEvent.click(screen.getByRole('radio',{name:'Diagram'}));
+  const before=source().value;
+  const file=new File(['invalid PNG'],'clip.png',{type:'image/png'});
+  fireEvent.paste(source(),{clipboardData:{files:[file]}});
+  expect(await screen.findByRole('alert')).toHaveTextContent('not a readable PNG');
+  expect(source()).toHaveValue(before);
+  expect(storedAssets()).toEqual({});
 });
 
 test('uses the reference the user provides for a paired-compatible path',async()=>{
@@ -78,7 +112,7 @@ test('uses the reference the user provides for a paired-compatible path',async()
   fireEvent.change(screen.getByLabelText('Image reference'),{target:{value:'assets/photo.png'}});
   fireEvent.click(importButton());
   await waitFor(()=>expect(screen.getByText(/Imported assets\/photo\.png and inserted/)).toBeInTheDocument());
-  expect(source()).toHaveValue('flowchart LR\n  A --> B\n@{ img: "assets/photo.png" }');
+  expect(source()).toHaveValue('flowchart LR\n  A --> B\nimage1@{ img: "assets/photo.png", w: 16, h: 9, constraint: "on" }');
   expect(within(library()).getByText('assets/photo.png',{selector:'code'})).toBeInTheDocument();
   expect(storedAssets()).toEqual({'assets/photo.png':data});
 });
@@ -128,7 +162,7 @@ test('an image beyond the decoded-size limits is rejected with the measured size
   expect(storedAssets()).toEqual({});
 });
 
-test('a Markdown note pauses autosave while it carries an image and resumes after removal',async()=>{
+test('a Markdown note autosaves imported images through its approved attachments folder',async()=>{
   const markdown=createMarkdownDocument({mermaid:'graph TD\n',css:'node { color: red; }\n'});
   native.open.mockResolvedValue({handle:'handle-image',name:'note.md',text:markdown,revision:3});
   native.image.mockResolvedValue({name:'photo.png',data:pngDataUrl(8,8)});
@@ -139,22 +173,17 @@ test('a Markdown note pauses autosave while it carries an image and resumes afte
   fireEvent.click(screen.getByRole('radio',{name:'Styling'}));
   fireEvent.click(importButton());
   await waitFor(()=>expect(within(library()).getByText('photo.png',{selector:'code'})).toBeInTheDocument());
-  fireEvent.click(screen.getByRole('button',{name:'OK'}));
-  expect(screen.getByText('Save paused')).toBeInTheDocument();
-  expect(screen.getByText(/File autosave is paused/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole('button',{name:'Save'}));
-  expect(await screen.findByRole('dialog')).toHaveTextContent('Markdown asset storage is not specified yet');
-  expect(screen.getByRole('dialog')).toHaveTextContent('photo.png');
-  expect(native.write).not.toHaveBeenCalled();
-  fireEvent.click(screen.getByRole('button',{name:'OK'}));
+  await waitFor(()=>expect(native.write).toHaveBeenCalledOnce(),{timeout:2500});
+  expect(native.write.mock.calls[0][0].files).toEqual(expect.arrayContaining([expect.objectContaining({kind:'image',data:pngDataUrl(8,8)})]));
+  expect(native.write.mock.calls[0][0].text).toContain('orei:assets:v1');
   fireEvent.change(screen.getByLabelText('Diagram source'),{target:{value:'graph TD\n  A-->B\n'}});
-  await act(async()=>{await new Promise(resolve=>setTimeout(resolve,900));});
-  expect(native.write).not.toHaveBeenCalled();
+  await waitFor(()=>expect(native.write).toHaveBeenCalledTimes(2),{timeout:2500});
 
   fireEvent.click(screen.getByRole('button',{name:'Remove image photo.png'}));
   expect(screen.queryByText('Save paused')).not.toBeInTheDocument();
   fireEvent.change(screen.getByLabelText('Diagram source'),{target:{value:'graph TD\n  A-->C\n'}});
-  await waitFor(()=>expect(native.write).toHaveBeenCalled(),{timeout:2500});
+  await waitFor(()=>expect(native.write).toHaveBeenCalledTimes(3),{timeout:2500});
   expect(native.write.mock.calls.at(-1)![0].text).toContain('A-->C');
 });
 
@@ -175,7 +204,7 @@ test('a paired document embeds the selected image in its index and reopens witho
   const written=native.paired.mock.calls[0][0];
   const index=JSON.parse(written.assets);
   expect(index.assets['assets/photo.png']).toEqual({kind:'image',mediaType:'image/png',encoding:'data-url',data});
-  expect(written.source).toContain('@{ img: "assets/photo.png" }');
+  expect(written.source).toContain('image1@{ img: "assets/photo.png", w: 8, h: 8, constraint: "on" }');
 
   // Reopen from the index alone: the original PNG is gone and is never requested.
   first.unmount();
@@ -186,14 +215,14 @@ test('a paired document embeds the selected image in its index and reopens witho
   start();
   fireEvent.click(screen.getByRole('button',{name:'Open'}));
   await waitFor(()=>expect(screen.getByRole('tab',{name:'pick.mmd'})).toHaveAttribute('aria-selected','true'));
-  expect(source()).toHaveValue('flowchart LR\n  A --> B\n@{ img: "assets/photo.png" }');
+  expect(source()).toHaveValue('flowchart LR\n  A --> B\nimage1@{ img: "assets/photo.png", w: 8, h: 8, constraint: "on" }');
   fireEvent.click(screen.getByRole('radio',{name:'Styling'}));
   expect(within(library()).getByText('assets/photo.png',{selector:'code'})).toBeInTheDocument();
   expect(native.asset).not.toHaveBeenCalled();
   expect(screen.queryByText(/Missing adjacent document assets/)).not.toBeInTheDocument();
 });
 
-test('the imported image travels into a paired Save Copy and Markdown conversion stays refused',async()=>{
+test('the imported image travels into a paired Save Copy and Markdown no longer refuses attachments',async()=>{
   const data=pngDataUrl(8,8);
   native.open.mockResolvedValue(pair());
   native.image.mockResolvedValue({name:'photo.png',data});
@@ -207,19 +236,17 @@ test('the imported image travels into a paired Save Copy and Markdown conversion
   fireEvent.click(importButton());
   await waitFor(()=>expect(within(library()).getByText('assets/photo.png',{selector:'code'})).toBeInTheDocument());
 
-  fireEvent.click(screen.getByRole('button',{name:'Save Copy'}));
+  await requestDocument(native.documentRequests,'save-copy');
   expect(await screen.findByRole('dialog')).toHaveTextContent('Destination format');
-  // Markdown cannot carry the image yet: the shared gate explains it and refuses the copy.
+  // Markdown attachments carry the image and the native destination call publishes it.
   fireEvent.click(screen.getByRole('radio',{name:'Markdown note'}));
-  expect(screen.getByRole('dialog')).toHaveTextContent('Markdown asset storage is not specified yet');
-  expect(screen.getByRole('dialog')).toHaveTextContent('assets/photo.png');
-  expect(screen.getByRole('button',{name:'Save copy…'})).toBeDisabled();
+  expect(screen.getByRole('button',{name:'Save copy…'})).toBeEnabled();
   // The paired copy carries the same embedded data URL in its adjacent asset index.
   fireEvent.click(screen.getByRole('radio',{name:'Paired Mermaid + CSS'}));
   fireEvent.click(screen.getByRole('button',{name:'Save copy…'}));
   await waitFor(()=>expect(native.pairCopy).toHaveBeenCalledOnce());
   const copied=native.pairCopy.mock.calls[0][0];
-  expect(copied.source).toContain('@{ img: "assets/photo.png" }');
+  expect(copied.source).toContain('image1@{ img: "assets/photo.png", w: 8, h: 8, constraint: "on" }');
   expect(JSON.parse(copied.assets).assets['assets/photo.png']).toEqual({kind:'image',mediaType:'image/png',encoding:'data-url',data});
 });
 
@@ -234,6 +261,6 @@ test('an imported image reopens from local draft recovery without the original f
   expect(screen.getByRole('tab',{name:'Untitled 1'})).toHaveAttribute('aria-selected','true');
   fireEvent.click(screen.getByRole('radio',{name:'Styling'}));
   expect(within(library()).getByText('photo.png',{selector:'code'})).toBeInTheDocument();
-  expect(source()).toHaveValue('flowchart LR\n  A --> B\n@{ img: "photo.png" }');
+  expect(source()).toHaveValue('flowchart LR\n  A --> B\nimage1@{ img: "photo.png", w: 8, h: 8, constraint: "on" }');
   expect(screen.queryByRole('alert')).not.toBeInTheDocument();
 });

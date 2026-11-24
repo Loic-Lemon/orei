@@ -3,7 +3,7 @@
 // owns the map shape and paired-document.ts writes the same key into the adjacent asset
 // index, so a reopen does not need the original image file. This module owns the image
 // limits and messages shared by the import control, the renderer, and the paired codec;
-// standalone Markdown keeps refusing to save while any asset is present.
+// standalone Markdown saves the same assets as sidecar attachments.
 import { addAsset, IMPORTED_ASSET_LIMIT, type DocumentAssets } from './document-assets';
 
 export const MAX_IMAGE_DATA_URL = 2_000_000;
@@ -70,6 +70,35 @@ export function pngSize(data: string): { width: number; height: number } | undef
   const view = new DataView(header.buffer);
   if (view.getUint32(8) !== 13 || String.fromCharCode(header[12], header[13], header[14], header[15]) !== 'IHDR') return undefined;
   return { width: view.getUint32(16), height: view.getUint32(20) };
+}
+
+/** Builds a reusable Mermaid image attribute, including dimensions when its PNG header is readable. */
+export function imageSnippet(reference: string, data: string): string {
+  const size = pngSize(data);
+  const img = `@{ img: ${JSON.stringify(reference)}`;
+  if (!size?.width || !size.height) return `${img}, constraint: "on" }`;
+  const scale = Math.min(1, 240 / Math.max(size.width, size.height));
+  const width = Math.max(1, Math.round(size.width * scale));
+  const height = Math.max(1, Math.round(size.height * scale));
+  return `${img}, w: ${width}, h: ${height}, constraint: "on" }`;
+}
+
+/** Reads a clipboard image after checking its raw size against the stored data-URL limit. */
+export async function readClipboardPng(file: File): Promise<string> {
+  const prefix = 'data:image/png;base64,';
+  const maxBytes = Math.floor((MAX_IMAGE_DATA_URL - prefix.length) / 4) * 3;
+  if (file.size > maxBytes) {
+    throw new Error(`Clipboard image is too large. The encoded PNG must stay within ${MAX_IMAGE_DATA_URL.toLocaleString('en-US')} characters.`);
+  }
+
+  const data = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('Could not read clipboard image'));
+    reader.onerror = () => reject(reader.error ?? new Error('Could not read clipboard image'));
+    reader.onabort = () => reject(new Error('Clipboard image read was aborted'));
+    reader.readAsDataURL(file);
+  });
+  return file.type ? data : `${prefix}${data.slice(data.indexOf(',') + 1)}`;
 }
 
 /**

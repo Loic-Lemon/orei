@@ -21,6 +21,8 @@ const ASSET_SUFFIX: &str = "orei-assets.json";
 #[derive(Clone, Debug, Serialize)]
 pub struct OpenPair {
     pub handle: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location_id: Option<String>,
     pub base: String,
     pub source_name: String,
     pub source: String,
@@ -53,6 +55,14 @@ pub struct WriteOutcome {
     /// Versions displaced by a Keep Local that differed from the compared one, named so the
     /// dialog can show them instead of silently dropping a late external edit.
     pub retained: Vec<document_io::RetainedVersion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub untouched_companions: Option<UntouchedCompanions>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct UntouchedCompanions {
+    pub css: Option<String>,
+    pub assets: Option<String>,
 }
 
 /// The group version the user compared in the conflict dialog, per member. Keep Local only
@@ -226,6 +236,7 @@ impl PairRegistry {
         let handle = format!("orei-pair-{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
         let opened = OpenPair {
             handle: handle.clone(),
+            location_id: None,
             base: stem,
             source_name,
             source: source.clone(),
@@ -276,6 +287,7 @@ impl PairRegistry {
                         written: Vec::new(),
                         failure: Some(WriteFailure { member: name.into(), message: "Document changed on disk".into() }),
                         retained: entry.retained(),
+                        untouched_companions: None,
                     });
                 }
             }
@@ -309,7 +321,7 @@ impl PairRegistry {
             Ok(())
         })();
         let failure = result.err().map(|(member, message)| WriteFailure { member: member.into(), message });
-        Ok(WriteOutcome { revisions, written, failure, retained: entry.retained() })
+        Ok(WriteOutcome { revisions, written, failure, retained: entry.retained(), untouched_companions: None })
     }
 
     /// Reads every group member without adopting anything. Members that exist on disk but were
@@ -383,6 +395,7 @@ impl PairRegistry {
         };
         Ok(OpenPair {
             handle: handle.to_owned(),
+            location_id: None,
             base,
             source_name,
             source,
@@ -426,7 +439,13 @@ impl PairRegistry {
             Ok(())
         })();
         let failure = result.err().map(|(member, message)| WriteFailure { member: member.into(), message });
-        Ok(WriteOutcome { revisions, written, failure, retained: entry.retained() })
+        // A restored draft can lack a companion that exists in the reopened group.
+        // Return the baseline of each untouched member so the editor can keep including it.
+        let preserved_css = entry.css.as_ref().filter(|_| css.is_none()).map(|member| member.baseline.clone());
+        let preserved_assets = entry.assets.as_ref().filter(|_| assets.is_none()).map(|member| member.baseline.clone());
+        let untouched_companions = (preserved_css.is_some() || preserved_assets.is_some())
+            .then_some(UntouchedCompanions { css: preserved_css, assets: preserved_assets });
+        Ok(WriteOutcome { revisions, written, failure, retained: entry.retained(), untouched_companions })
     }
 
     /// Drops the session. Versions displaced into retention by a raced save are put back on
@@ -640,6 +659,23 @@ mod tests {
         assert_eq!(opened.revisions, PairRevisions { source: 1, css: Some(1), assets: Some(1) });
         assert!(!opened.handle.is_empty());
         assert_eq!([fs::read(&source).unwrap(), fs::read(&css).unwrap(), fs::read(&assets).unwrap()], before);
+    }
+
+    #[test]
+    fn keeping_local_source_reports_a_tracked_companion_it_did_not_replace() {
+        let dir = directory("keep-companion");
+        let source = dir.join("diagram.mmd");
+        let css = dir.join("diagram.css");
+        fs::write(&source, "graph TD\n").unwrap();
+        fs::write(&css, "/* added outside orei */\n").unwrap();
+        let mut registry = PairRegistry::default();
+        let opened = registry.authorize(source).unwrap();
+        let outcome = registry.overwrite(&opened.handle, "graph LR\n", None, None, None).unwrap();
+        assert!(outcome.failure.is_none());
+        assert_eq!(outcome.written, ["source"]);
+        assert_eq!(outcome.untouched_companions.unwrap().css.as_deref(), Some("/* added outside orei */\n"));
+        assert_eq!(fs::read_to_string(css).unwrap(), "/* added outside orei */\n");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

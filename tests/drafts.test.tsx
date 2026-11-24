@@ -76,7 +76,7 @@ test('new identities do not collide and view settings and undo stay with their t
   fireEvent.change(screen.getByLabelText('Preview zoom'),{target:{value:'150'}});
   fireEvent.blur(screen.getByLabelText('Preview zoom'));
   fireEvent.click(screen.getByRole('button',{name:'New document'}));
-  expect(screen.getByLabelText('Preview zoom')).toHaveValue(115);
+  expect(screen.getByLabelText('Preview zoom')).toHaveValue(100);
   fireEvent.click(screen.getByRole('button',{name:'New document'}));
   expect(screen.getByRole('tab',{name:'Untitled 2'})).toBeInTheDocument();
   fireEvent.click(screen.getByRole('tab',{name:'small'}));

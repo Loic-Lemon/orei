@@ -120,6 +120,26 @@ impl Registry {
         Ok(entry.revision)
     }
 
+    /// Checks the known revision and on-disk baseline before a Markdown save publishes assets.
+    /// `write` repeats both checks immediately before replacing the note.
+    pub fn check_write(&self, handle: &str, revision: u64, text: &str) -> Result<(), String> {
+        if text.len() as u64 > LIMIT { return Err("Document exceeds 8 MiB".into()); }
+        let entry = self.entries.get(handle).ok_or("Unknown document handle")?;
+        if revision != entry.revision { return Err("Document revision conflict".into()); }
+        if read_utf8(&entry.path)? != entry.baseline { return Err("Document changed on disk".into()); }
+        Ok(())
+    }
+
+    pub fn check_overwrite(&self, handle: &str, text: &str) -> Result<(), String> {
+        if text.len() as u64 > LIMIT { return Err("Document exceeds 8 MiB".into()); }
+        self.entries.get(handle).ok_or("Unknown document handle")?;
+        Ok(())
+    }
+
+    pub fn path(&self, handle: &str) -> Result<PathBuf, String> {
+        self.entries.get(handle).map(|entry| entry.path.clone()).ok_or_else(|| "Unknown document handle".into())
+    }
+
     /// Reads the destination without adopting it. The caller compares versions and decides
     /// whether to reload or overwrite; a watcher notification is never itself permission.
     pub fn inspect(&self, handle: &str) -> Result<DocumentState, String> {
@@ -344,9 +364,18 @@ pub fn copy_path(path: &Path) -> Result<PathBuf, String> {
 
 pub fn create_copy(path: &Path, text: &str) -> Result<PathBuf, String> {
     let path = copy_path(path)?;
-    if text.len() as u64 > LIMIT { return Err("Document exceeds 8 MiB".into()); }
+    check_new_destination(&path, text)?;
     create_with(&path, "copy", |file| file.write_all(text.as_bytes()))?;
     Ok(path)
+}
+
+pub fn check_new_destination(path: &Path, text: &str) -> Result<(), String> {
+    if text.len() as u64 > LIMIT { return Err("Document exceeds 8 MiB".into()); }
+    match fs::symlink_metadata(path) {
+        Ok(_) => Err("Could not save: the destination already exists".into()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not save: {error}")),
+    }
 }
 
 /// Create a new paired-group member never replacing an existing destination. Used for a

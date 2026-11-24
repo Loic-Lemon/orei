@@ -3,15 +3,16 @@ import {cleanup,fireEvent,render,screen,waitFor} from '@testing-library/react';
 import '@testing-library/jest-dom/vitest';
 import {App} from '../src/App';
 import {ensureFixtures,seedFixtures} from './seed';
+import { requestDocument, type NativeDocumentListener } from './native-document-request';
 import {createMarkdownDocument,parseMarkdownDocument} from '../src/markdown-document';
 
-const native=vi.hoisted(()=>({open:vi.fn(),save:vi.fn()}));
-vi.mock('@tauri-apps/api/core',()=>({invoke:vi.fn(async(command:string,args?:{text:string})=>command==='open_named_document'?native.open():command==='save_document_copy'?native.save(args):false)}));
-vi.mock('@tauri-apps/api/event',()=>({listen:async()=>()=>{}}));
+const native=vi.hoisted(()=>({open:vi.fn(),prepare:vi.fn(),save:vi.fn(),documentRequests:new Set<NativeDocumentListener>()}));
+vi.mock('@tauri-apps/api/core',()=>({invoke:vi.fn(async(command:string,args?:{text:string})=>command==='open_named_document'?native.open():command==='prepare_markdown_destination'?native.prepare(args):command==='save_markdown_copy'?native.save(args):command==='cancel_markdown_destination'?true:false)}));
+vi.mock('@tauri-apps/api/event',()=>({listen:async(name:string,listener:NativeDocumentListener)=>{if(name==='document-request'){native.documentRequests.add(listener);return()=>native.documentRequests.delete(listener);}return()=>{};}}));
 vi.mock('../src/runner',()=>({startRunner:vi.fn()}));
 vi.mock('../src/rendering',()=>({renderDiagram:async()=>({svg:'<svg/>',width:100,height:100})}));
-afterEach(()=>{cleanup();localStorage.clear();native.open.mockReset();native.save.mockReset();Reflect.deleteProperty(window,'__TAURI_INTERNALS__');});
-const start=()=>{ensureFixtures();Object.defineProperty(window,'__TAURI_INTERNALS__',{value:{},configurable:true});return render(<App/>);};
+afterEach(()=>{cleanup();localStorage.clear();native.open.mockReset();native.prepare.mockReset();native.save.mockReset();Reflect.deleteProperty(window,'__TAURI_INTERNALS__');});
+const start=()=>{native.prepare.mockResolvedValue({destination:'copy-destination',attachments:'../attachments',namespace:'copy-destination'});ensureFixtures();Object.defineProperty(window,'__TAURI_INTERNALS__',{value:{},configurable:true});return render(<App/>);};
 const markdown=createMarkdownDocument({mermaid:'graph TD\n',css:'node { color: red; }\n'});
 
 test('opens a file from an empty workspace without creating an untitled tab',async()=>{
@@ -39,12 +40,17 @@ test('opens Markdown beside another draft, edits both blocks, restores, and save
   app.unmount();start();
   expect(screen.getByLabelText('Diagram source')).toHaveValue('graph TD\n  A-->B\n');
   native.save.mockResolvedValue(true);
-  fireEvent.click(screen.getByRole('button',{name:'Save Copy'}));
+  await requestDocument(native.documentRequests,'save-copy');
   fireEvent.click(screen.getByRole('button',{name:'Save copy…'}));
   await waitFor(()=>expect(native.save).toHaveBeenCalledOnce());
   const saved=native.save.mock.calls[0][0].text;
-  expect(saved).toBe(original.replace('graph TD\n','graph TD\n  A-->B\n').replace('node { color: red; }','node { color: blue; }'));
+  expect(saved).toContain('title: "Example"');
+  expect(saved).toContain('Keep this prose exactly.');
+  expect(saved).toContain('More prose after the diagram.');
+  // Inline styling stays in the note: a note with no sidecar assets needs no attachments
+  // folder and must not be silently reshaped into the external-stylesheet form.
   expect(parseMarkdownDocument(saved)).toEqual({mermaid:'graph TD\n  A-->B\n',css:'node { color: blue; }\n'});
+  expect(native.save.mock.calls[0][0].files).toEqual([]);
 });
 
 test('save cancellation and failure retain the Markdown draft and recovery',async()=>{
@@ -54,10 +60,10 @@ test('save cancellation and failure retain the Markdown draft and recovery',asyn
   await waitFor(()=>expect(screen.getByLabelText('Diagram source')).toHaveValue('graph TD\n'));
   fireEvent.change(screen.getByLabelText('Diagram source'),{target:{value:'unfinished'}});
   const before=localStorage.getItem('orei-drafts-v1');
-  fireEvent.click(screen.getByRole('button',{name:'Save Copy'}));
+  await requestDocument(native.documentRequests,'save-copy');
   fireEvent.click(screen.getByRole('button',{name:'Save copy…'}));
   await waitFor(()=>expect(native.save).toHaveBeenCalledTimes(1));
-  fireEvent.click(screen.getByRole('button',{name:'Save Copy'}));
+  await requestDocument(native.documentRequests,'save-copy');
   fireEvent.click(screen.getByRole('button',{name:'Save copy…'}));
   expect(await screen.findByRole('dialog')).toHaveTextContent('destination exists');
   expect(screen.getByLabelText('Diagram source')).toHaveValue('unfinished');
@@ -88,7 +94,7 @@ test('warns when edits arrive while the save picker is open',async()=>{
   native.save.mockReturnValue(new Promise<boolean>(resolve=>{finish=resolve;}));
   start();fireEvent.click(screen.getByRole('button',{name:'New document'}));
   fireEvent.change(screen.getByLabelText('Diagram source'),{target:{value:'before'}});
-  fireEvent.click(screen.getByRole('button',{name:'Save Copy'}));
+  await requestDocument(native.documentRequests,'save-copy');
   fireEvent.click(screen.getByRole('button',{name:'Save copy…'}));
   await waitFor(()=>expect(native.save).toHaveBeenCalledOnce());
   fireEvent.change(screen.getByLabelText('Diagram source'),{target:{value:'after'}});

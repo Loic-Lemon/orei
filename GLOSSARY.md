@@ -22,6 +22,12 @@ A diagram document stored as a same-basename `.mmd` diagram source, an optional 
 **Paired asset index**:
 The adjacent JSON file that carries a paired document's custom icon definitions and embedded local images, so reopening does not depend on the original import library or image files. It records a format and version plus typed, encoded entries; malformed indexes are refused rather than rewritten.
 
+**Markdown note**:
+One `.md` file holding a single Mermaid fenced block, a marked CSS block, and an optional `<!-- orei:assets:v1 {...} -->` manifest. It opens as one diagram document.
+
+**Attachments folder**:
+The user-approved folder that holds a Markdown note's sidecar files: images, custom icons, and an external stylesheet when the note has one. The note's manifest records each path relative to the note; the folder is read-only until the user approves it for writing in that session.
+
 **Preview**:
 The rendered view of the diagram document being edited.
 
@@ -41,7 +47,7 @@ A diagram document that has not yet been assigned a filename and format, retaine
 A view of the diagram whose composition stays the same when the viewing area is resized, with zoom and pan for navigation.
 
 **Responsive preview**:
-A view of the diagram whose composition adapts to the width of the viewing area.
+A view of the diagram whose composition adapts to the width of the viewing area. The preview auto-fits the pane width until a manual zoom takes over.
 
 **Diagram export**:
 A rendered diagram prepared for use outside orei, distinct from the editable diagram document.
